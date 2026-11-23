@@ -1,0 +1,6 @@
+{
+  "name": "PhonkCast 24/7 — Glassmorphic YouTube Live Studio",
+  "description": "24/7 YouTube Live Phonk music broadcast studio with direct RTMP stream key support, adaptive cover-color glassmorphic live screen, continuous loop queue, and real-time Phonk audio FX.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
