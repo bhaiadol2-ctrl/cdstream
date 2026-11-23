@@ -35,6 +35,7 @@ export interface StreamConfig {
   autoReconnect: boolean;
   mode: StreamMode;
   dryRun: boolean;
+  visuals?: VisualSettings;
 }
 
 export interface StreamStatus {
@@ -74,6 +75,16 @@ export interface VisualSettings {
   showUpNext: boolean;
   ambientDrift: boolean;
 }
+
+export const DEFAULT_VISUAL_SETTINGS: VisualSettings = {
+  glassBlurPx: 26,
+  glassOpacity: 0.56,
+  bassPulse: true,
+  visualizerStyle: 'bars',
+  showLiveBadge: true,
+  showUpNext: true,
+  ambientDrift: true,
+};
 
 export function clamp(val: number, min: number, max: number): number {
   if (!Number.isFinite(val)) return min;
@@ -253,6 +264,8 @@ export function maskStreamKey(key: string): string {
 const PRIVATE_HOST_RE =
   /^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|169\.254\.\d+\.\d+|\[?::1\]?|0\.0\.0\.0)$/i;
 
+export const DEFAULT_YOUTUBE_RTMPS_URL = 'rtmps://a.rtmps.youtube.com:443/live2';
+
 export function validateRtmpTarget(
   rtmpUrl: string,
   streamKey: string,
@@ -265,11 +278,11 @@ export function validateRtmpTarget(
   if (trimmedKey && !/^[a-zA-Z0-9._-]{4,128}$/.test(trimmedKey)) {
     return {
       valid: false,
-      error: 'Stream Key contains invalid characters. Use letters, numbers, dashes, or underscores.',
+      error: 'Stream Key contains invalid characters. Paste only the Stream Key (not the full URL).',
     };
   }
 
-  const trimmedUrl = rtmpUrl.trim() || 'rtmp://a.rtmp.youtube.com/live2';
+  const trimmedUrl = rtmpUrl.trim() || DEFAULT_YOUTUBE_RTMPS_URL;
   let parsed: URL;
   try {
     parsed = new URL(trimmedUrl);
@@ -278,7 +291,7 @@ export function validateRtmpTarget(
   }
 
   if (parsed.protocol !== 'rtmp:' && parsed.protocol !== 'rtmps:') {
-    return { valid: false, error: 'RTMP URL must start with rtmp:// or rtmps://.' };
+    return { valid: false, error: 'RTMP URL must start with rtmps:// or rtmp://.' };
   }
 
   if (!dryRun && PRIVATE_HOST_RE.test(parsed.hostname)) {

@@ -181,13 +181,15 @@ export function LiveGlassScreen({
           const bw = bCanvas.width;
           const bh = bCanvas.height;
           const pal = currentTrack?.palette;
+          const accent = pal?.accent || '#ff4d5a';
+          const primary = pal?.primary || '#d42638';
           bctx.fillStyle = pal?.secondary || '#0b0c12';
           bctx.fillRect(0, 0, bw, bh);
 
           // Blurred cover backdrop
           if (coverImgRef.current) {
             bctx.save();
-            bctx.filter = `blur(${Math.max(18, visuals.glassBlurPx)}px) brightness(0.42) saturate(1.35)`;
+            bctx.filter = `blur(${Math.max(18, visuals.glassBlurPx)}px) brightness(0.46) saturate(1.45)`;
             const scale = 1.12 + (visuals.bassPulse ? bassEnergy * 0.06 : 0);
             const dw = bw * scale;
             const dh = bh * scale;
@@ -195,99 +197,232 @@ export function LiveGlassScreen({
             bctx.restore();
           }
 
-          // Frosted Glass Center Panel
-          const cardW = 940;
-          const cardH = 420;
-          const cardX = (bw - cardW) / 2;
-          const cardY = (bh - cardH) / 2 - 22;
+          // Radial ambient glows + vignette matching DOM
+          const g1 = bctx.createRadialGradient(bw * 0.28, bh * 0.35, 10, bw * 0.28, bh * 0.35, bw * 0.52);
+          g1.addColorStop(0, pal?.glowRgba || 'rgba(212, 38, 56, 0.44)');
+          g1.addColorStop(1, 'rgba(0,0,0,0)');
+          bctx.fillStyle = g1;
+          bctx.fillRect(0, 0, bw, bh);
+
+          const vig = bctx.createLinearGradient(0, 0, 0, bh);
+          vig.addColorStop(0, 'rgba(8,9,13,0.30)');
+          vig.addColorStop(1, 'rgba(8,9,13,0.78)');
+          bctx.fillStyle = vig;
+          bctx.fillRect(0, 0, bw, bh);
 
           bctx.save();
+
+          // Top Broadcast Badge + Track Counter
+          if (visuals.showLiveBadge) {
+            bctx.fillStyle = 'rgba(0,0,0,0.42)';
+            bctx.strokeStyle = 'rgba(255,255,255,0.18)';
+            bctx.lineWidth = 1.2;
+            bctx.beginPath();
+            bctx.roundRect(36, 24, 218, 32, 8);
+            bctx.fill();
+            bctx.stroke();
+
+            bctx.fillStyle = '#ef4444';
+            bctx.beginPath();
+            bctx.arc(54, 40, 4.5, 0, Math.PI * 2);
+            bctx.fill();
+
+            bctx.fillStyle = '#f4f4f5';
+            bctx.font = '700 13px "JetBrains Mono", monospace';
+            const liveLabel = streamStatus.dryRun ? 'TEST LIVE' : 'YOUTUBE LIVE';
+            bctx.fillText(`${liveLabel} · ${formatUptimeHHMMSS(streamStatus.uptimeSec)}`, 67, 45);
+          }
+
+          bctx.fillStyle = 'rgba(228,228,231,0.85)';
+          bctx.font = '500 13px "JetBrains Mono", monospace';
+          bctx.fillText(
+            `Track ${trackIndex + 1} of ${Math.max(1, totalTracks)} · ${currentTrack?.bpm || 136} BPM`,
+            visuals.showLiveBadge ? 270 : 36,
+            45
+          );
+
+          // Frosted Glass Center Panel
+          const cardW = 860;
+          const cardH = 318;
+          const cardX = (bw - cardW) / 2;
+          const cardY = 138;
+
           bctx.fillStyle = pal?.glassBgRgba || 'rgba(12, 14, 20, 0.56)';
           bctx.strokeStyle = pal?.glassBorderRgba || 'rgba(255, 255, 255, 0.22)';
-          bctx.lineWidth = 2;
+          bctx.lineWidth = 1.5;
           bctx.beginPath();
-          bctx.roundRect(cardX, cardY, cardW, cardH, 28);
+          bctx.roundRect(cardX, cardY, cardW, cardH, 22);
           bctx.fill();
           bctx.stroke();
 
-          // Album artwork inside glass card
-          const artSize = 316;
-          const artX = cardX + 48;
+          // Diagonal specular highlight sheen
+          const sheen = bctx.createLinearGradient(cardX, cardY, cardX + cardW, cardY + cardH);
+          sheen.addColorStop(0, 'rgba(255,255,255,0.12)');
+          sheen.addColorStop(0.45, 'rgba(255,255,255,0.02)');
+          sheen.addColorStop(1, 'rgba(255,255,255,0.05)');
+          bctx.fillStyle = sheen;
+          bctx.beginPath();
+          bctx.roundRect(cardX, cardY, cardW, cardH, 22);
+          bctx.fill();
+
+          // Rounded Album Artwork inside Glass Card
+          const artSize = 238;
+          const artX = cardX + 36;
           const artY = cardY + (cardH - artSize) / 2;
+          const pulseScale = visuals.bassPulse ? 1 + bassEnergy * 0.04 : 1;
+          const pulsedSize = artSize * pulseScale;
+          const pArtX = artX - (pulsedSize - artSize) / 2;
+          const pArtY = artY - (pulsedSize - artSize) / 2;
+
           bctx.save();
           bctx.beginPath();
-          bctx.roundRect(artX, artY, artSize, artSize, 18);
+          bctx.roundRect(pArtX, pArtY, pulsedSize, pulsedSize, 16);
           bctx.clip();
           if (coverImgRef.current) {
-            bctx.drawImage(coverImgRef.current, artX, artY, artSize, artSize);
+            bctx.drawImage(coverImgRef.current, pArtX, pArtY, pulsedSize, pulsedSize);
           } else {
-            bctx.fillStyle = pal?.primary || '#d42638';
-            bctx.fillRect(artX, artY, artSize, artSize);
+            bctx.fillStyle = primary;
+            bctx.fillRect(pArtX, pArtY, pulsedSize, pulsedSize);
           }
           bctx.restore();
 
+          bctx.strokeStyle = 'rgba(255,255,255,0.26)';
+          bctx.lineWidth = 1.5;
+          bctx.beginPath();
+          bctx.roundRect(pArtX, pArtY, pulsedSize, pulsedSize, 16);
+          bctx.stroke();
+
           // Typography & spectrum inside glass card
-          const tx = artX + artSize + 44;
-          bctx.fillStyle = pal?.accent || '#ff4d5a';
-          bctx.font = '600 18px Outfit, sans-serif';
-          bctx.fillText(
-            `${(currentTrack?.subgenre || 'PHONK').toUpperCase()}  ·  TRACK ${trackIndex + 1} OF ${Math.max(1, totalTracks)}`,
-            tx,
-            artY + 34
-          );
+          const tx = artX + artSize + 36;
+          bctx.fillStyle = accent;
+          bctx.font = '700 13px Outfit, sans-serif';
+          bctx.fillText(`${(currentTrack?.subgenre || 'PHONK').toUpperCase()}  ·  24/7 LOOP`, tx, artY + 24);
 
           bctx.fillStyle = '#ffffff';
-          bctx.font = '700 44px Outfit, sans-serif';
-          bctx.fillText((currentTrack?.title || 'Waiting for Phonk Track').slice(0, 28), tx, artY + 94);
+          bctx.font = '700 36px Outfit, sans-serif';
+          bctx.fillText((currentTrack?.title || 'Waiting for Phonk Track').slice(0, 26), tx, artY + 68);
 
-          bctx.fillStyle = 'rgba(244, 244, 245, 0.78)';
-          bctx.font = '500 24px Plus Jakarta Sans, sans-serif';
-          bctx.fillText(`${currentTrack?.artist || 'Phonk Studio'}  ·  ${currentTrack?.bpm || 136} BPM`, tx, artY + 136);
+          bctx.fillStyle = 'rgba(244, 244, 245, 0.82)';
+          bctx.font = '500 18px "Plus Jakarta Sans", sans-serif';
+          bctx.fillText(currentTrack?.artist || 'Phonk Studio', tx, artY + 100);
 
-          // Spectrum bars in broadcast canvas
-          const specW = 470;
-          const specH = 100;
+          // Rounded dark spectrum tray matching DOM
+          const specW = cardX + cardW - 36 - tx;
+          const specH = 82;
           const specX = tx;
           const specY = artY + artSize - specH;
-          bctx.fillStyle = pal?.accent || '#ff4d5a';
-          const bBars = 36;
-          const bGap = 5;
-          const bBarW = (specW - bGap * (bBars - 1)) / bBars;
-          for (let i = 0; i < bBars; i++) {
-            const norm = isPlaying ? (freq[i % freq.length] || 0) / 255 : 0.1;
-            const hBar = Math.max(5, norm * specH);
-            bctx.beginPath();
-            bctx.roundRect(specX + i * (bBarW + bGap), specY + (specH - hBar), bBarW, hBar, 3);
-            bctx.fill();
+          bctx.fillStyle = 'rgba(0,0,0,0.34)';
+          bctx.beginPath();
+          bctx.roundRect(specX, specY, specW, specH, 12);
+          bctx.fill();
+
+          const bGrad = bctx.createLinearGradient(0, specY + specH, 0, specY);
+          bGrad.addColorStop(0, primary);
+          bGrad.addColorStop(1, accent);
+          bctx.fillStyle = bGrad;
+          bctx.strokeStyle = accent;
+
+          const bBars = 40;
+          if (visuals.visualizerStyle === 'ring') {
+            const cx = specX + specW / 2;
+            const cy = specY + specH / 2;
+            const baseR = specH * 0.28;
+            bctx.lineWidth = 3;
+            for (let i = 0; i < bBars; i++) {
+              const raw = isPlaying ? (freq[i % freq.length] || 0) / 255 : 0.14;
+              const angle = (i / bBars) * Math.PI * 2 - Math.PI / 2;
+              const len = 5 + raw * (specH * 0.22);
+              bctx.beginPath();
+              bctx.moveTo(cx + Math.cos(angle) * baseR, cy + Math.sin(angle) * baseR);
+              bctx.lineTo(cx + Math.cos(angle) * (baseR + len), cy + Math.sin(angle) * (baseR + len));
+              bctx.stroke();
+            }
+          } else {
+            const bGap = 4;
+            const bPad = 10;
+            const innerW = specW - bPad * 2;
+            const innerH = specH - 16;
+            const bBarW = Math.max(3, (innerW - bGap * (bBars - 1)) / bBars);
+            for (let i = 0; i < bBars; i++) {
+              const binIdx = Math.min(freq.length - 1, Math.floor((i / bBars) * 38));
+              const norm = isPlaying
+                ? (freq[binIdx] || 0) / 255
+                : 0.08 + 0.06 * Math.sin(phase * 1.8 + i * 0.35);
+              const hBar = Math.max(4, norm * innerH);
+              const bx = specX + bPad + i * (bBarW + bGap);
+              const by =
+                visuals.visualizerStyle === 'mirror'
+                  ? specY + (specH - hBar) / 2
+                  : specY + specH - 8 - hBar;
+              bctx.beginPath();
+              bctx.roundRect(bx, by, bBarW, hBar, 3);
+              bctx.fill();
+            }
           }
 
-          // Bottom timer & progress bar
-          const barW = cardW;
-          const barX = cardX;
-          const barY = bh - 72;
+          // Bottom Glassmorphic Progress Dock
+          const dockW = 940;
+          const dockH = 92;
+          const dockX = (bw - dockW) / 2;
+          const dockY = bh - 124;
+          const progX = dockX + 94;
+          const progW = dockW - 188;
+          const progY = dockY + 24;
           const pct = computeProgressPercent(elapsedSec, durationSec) / 100;
 
-          bctx.fillStyle = '#ffffff';
-          bctx.font = '600 22px "JetBrains Mono", monospace';
-          bctx.fillText(`${formatTimeMMSS(elapsedSec)}  /  ${formatTimeMMSS(durationSec)}`, barX, barY - 18);
+          bctx.fillStyle = 'rgba(0,0,0,0.52)';
+          bctx.strokeStyle = pal?.glassBorderRgba || 'rgba(255,255,255,0.18)';
+          bctx.lineWidth = 1.3;
+          bctx.beginPath();
+          bctx.roundRect(dockX, dockY, dockW, dockH, 16);
+          bctx.fill();
+          bctx.stroke();
 
-          if (visuals.showUpNext && nextTrack) {
-            bctx.fillStyle = 'rgba(255,255,255,0.7)';
-            bctx.font = '500 18px Plus Jakarta Sans, sans-serif';
-            const nextTxt = `Next: ${nextTrack.title}`;
-            const m = bctx.measureText(nextTxt);
-            bctx.fillText(nextTxt, barX + barW - m.width, barY - 18);
-          }
+          bctx.fillStyle = '#ffffff';
+          bctx.font = '600 16px "JetBrains Mono", monospace';
+          bctx.fillText(formatTimeMMSS(elapsedSec), dockX + 24, progY + 8);
+
+          const totalTxt = formatTimeMMSS(durationSec);
+          bctx.fillStyle = 'rgba(212,212,216,0.92)';
+          const tm = bctx.measureText(totalTxt);
+          bctx.fillText(totalTxt, dockX + dockW - 24 - tm.width, progY + 8);
 
           bctx.fillStyle = 'rgba(255,255,255,0.16)';
           bctx.beginPath();
-          bctx.roundRect(barX, barY, barW, 6, 3);
+          bctx.roundRect(progX, progY, progW, 6, 3);
           bctx.fill();
 
-          bctx.fillStyle = pal?.accent || '#ff4d5a';
+          const fillW = Math.max(6, progW * pct);
+          bctx.fillStyle = accent;
           bctx.beginPath();
-          bctx.roundRect(barX, barY, Math.max(6, barW * pct), 6, 3);
+          bctx.roundRect(progX, progY, fillW, 6, 3);
           bctx.fill();
+
+          bctx.fillStyle = '#ffffff';
+          bctx.beginPath();
+          bctx.arc(progX + fillW, progY + 3, 5.5, 0, Math.PI * 2);
+          bctx.fill();
+
+          // ON AIR Pill + Up Next
+          bctx.fillStyle = accent;
+          bctx.beginPath();
+          bctx.roundRect(dockX + 24, dockY + 48, 102, 28, 8);
+          bctx.fill();
+
+          bctx.fillStyle = pal?.textOnAccent || '#090a0f';
+          bctx.beginPath();
+          bctx.arc(dockX + 41, dockY + 62, 4, 0, Math.PI * 2);
+          bctx.fill();
+          bctx.font = '700 12.5px "Plus Jakarta Sans", sans-serif';
+          bctx.fillText('ON AIR', dockX + 52, dockY + 67);
+
+          if (visuals.showUpNext && nextTrack) {
+            bctx.fillStyle = 'rgba(228,228,231,0.88)';
+            bctx.font = '500 13.5px "Plus Jakarta Sans", sans-serif';
+            const nextTxt = `Up Next: ${nextTrack.title.slice(0, 34)}`;
+            const nm = bctx.measureText(nextTxt);
+            bctx.fillText(nextTxt, dockX + dockW - 24 - nm.width, dockY + 67);
+          }
 
           bctx.restore();
         }

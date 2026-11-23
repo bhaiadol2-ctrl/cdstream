@@ -1,8 +1,10 @@
 import { ChildProcess, spawn } from 'child_process';
 import { EventEmitter } from 'events';
 import fs from 'fs';
+import net from 'net';
 import {
-  formatTimeMMSS,
+  DEFAULT_VISUAL_SETTINGS,
+  DEFAULT_YOUTUBE_RTMPS_URL,
   maskStreamKey,
   validateRtmpTarget,
   type PhonkTrack,
@@ -10,13 +12,20 @@ import {
   type StreamMode,
   type StreamState,
   type StreamStatus,
+  type VisualSettings,
 } from '../src/lib/phonkLogic.ts';
+import {
+  cleanupGlassRenderBundle,
+  generateGlassRenderBundle,
+  type GlassRenderBundle,
+} from './glassFrameGenerator.ts';
 import { resolveSafeAssetPath, type TrackStore } from './trackStore.ts';
 
 const FONT_CANDIDATES = [
+  '/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-SemiBold.ttf',
+  '/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf',
   '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
   '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
-  '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf',
 ];
 
 function findSystemFont(): string | null {
@@ -26,20 +35,27 @@ function findSystemFont(): string | null {
   return null;
 }
 
-function escapeDrawtext(text: string): string {
-  return text
-    .replace(/\\/g, '\\\\')
-    .replace(/:/g, '\\:')
-    .replace(/'/g, "\\'")
-    .replace(/%/g, '\\%')
-    .slice(0, 80);
+function probeTcpReachable(host: string, port: number, timeoutMs = 1800): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port, timeout: timeoutMs });
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.on('connect', () => done(true));
+    socket.on('timeout', () => done(false));
+    socket.on('error', () => done(false));
+  });
 }
 
 export class StreamEngine extends EventEmitter {
   private store: TrackStore;
   private streamKey = '';
   private config: StreamConfig = {
-    rtmpUrl: 'rtmp://a.rtmp.youtube.com/live2',
+    rtmpUrl: DEFAULT_YOUTUBE_RTMPS_URL,
     resolution: '1280x720',
     fps: 30,
     videoBitrateKbps: 4500,
@@ -47,6 +63,7 @@ export class StreamEngine extends EventEmitter {
     autoReconnect: true,
     mode: 'autonomous-24-7',
     dryRun: false,
+    visuals: { ...DEFAULT_VISUAL_SETTINGS },
   };
 
   private state: StreamState = 'idle';
@@ -60,8 +77,12 @@ export class StreamEngine extends EventEmitter {
   private measuredBitrateKbps = 0;
   private lastError: string | null = null;
 
-  private activeProc: ChildProcess | null = null;
+  private muxerProc: ChildProcess | null = null;
+  private workerProc: ChildProcess | null = null;
   private relayProc: ChildProcess | null = null;
+  private cumulativeTsOffsetSec = 0;
+  private workerStartedAt = 0;
+  private consecutiveWorkerFailures = 0;
   private stopRequested = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private uptimeInterval: NodeJS.Timeout | null = null;
@@ -74,7 +95,10 @@ export class StreamEngine extends EventEmitter {
   }
 
   setStreamKey(key: string): void {
-    this.streamKey = key.trim();
+    // Allow users who accidentally paste full rtmp(s)://.../live2/<key>
+    const trimmed = key.trim();
+    const match = trimmed.match(/^rtmps?:\/\/[^/]+\/live2\/([a-zA-Z0-9._-]+)$/i);
+    this.streamKey = match ? match[1] : trimmed;
     this.emitStatus();
   }
 
@@ -85,7 +109,7 @@ export class StreamEngine extends EventEmitter {
 
   updateConfig(patch: Partial<StreamConfig>): StreamConfig {
     if (typeof patch.rtmpUrl === 'string') {
-      this.config.rtmpUrl = patch.rtmpUrl.trim() || 'rtmp://a.rtmp.youtube.com/live2';
+      this.config.rtmpUrl = patch.rtmpUrl.trim() || DEFAULT_YOUTUBE_RTMPS_URL;
     }
     if (patch.resolution === '1280x720' || patch.resolution === '1920x1080') {
       this.config.resolution = patch.resolution;
@@ -107,6 +131,28 @@ export class StreamEngine extends EventEmitter {
     }
     if (typeof patch.dryRun === 'boolean') {
       this.config.dryRun = patch.dryRun;
+    }
+    if (patch.visuals && typeof patch.visuals === 'object') {
+      const v = patch.visuals as Partial<VisualSettings>;
+      const prev = this.config.visuals || DEFAULT_VISUAL_SETTINGS;
+      this.config.visuals = {
+        glassBlurPx:
+          typeof v.glassBlurPx === 'number'
+            ? Math.min(44, Math.max(12, Math.round(v.glassBlurPx)))
+            : prev.glassBlurPx,
+        glassOpacity:
+          typeof v.glassOpacity === 'number'
+            ? Math.min(0.75, Math.max(0.25, v.glassOpacity))
+            : prev.glassOpacity,
+        bassPulse: typeof v.bassPulse === 'boolean' ? v.bassPulse : prev.bassPulse,
+        visualizerStyle:
+          v.visualizerStyle === 'bars' || v.visualizerStyle === 'mirror' || v.visualizerStyle === 'ring'
+            ? v.visualizerStyle
+            : prev.visualizerStyle,
+        showLiveBadge: typeof v.showLiveBadge === 'boolean' ? v.showLiveBadge : prev.showLiveBadge,
+        showUpNext: typeof v.showUpNext === 'boolean' ? v.showUpNext : prev.showUpNext,
+        ambientDrift: typeof v.ambientDrift === 'boolean' ? v.ambientDrift : prev.ambientDrift,
+      };
     }
     this.emitStatus();
     return { ...this.config };
@@ -152,10 +198,10 @@ export class StreamEngine extends EventEmitter {
     }
     const baseUrl = this.config.rtmpUrl.replace(/\/+$/, '');
     const targetUrl = `${baseUrl}/${this.streamKey}`;
-    return ['-f', 'flv', '-flvflags', 'no_duration_filesize', targetUrl];
+    return ['-rw_timeout', '15000000', '-f', 'flv', '-flvflags', 'no_duration_filesize', targetUrl];
   }
 
-  start(modeOverride?: StreamMode): { ok: boolean; error?: string } {
+  async start(modeOverride?: StreamMode): Promise<{ ok: boolean; error?: string }> {
     if (modeOverride) {
       this.config.mode = modeOverride;
     }
@@ -176,12 +222,34 @@ export class StreamEngine extends EventEmitter {
       return { ok: false, error: this.lastError };
     }
 
+    // Auto-upgrade rtmp://a.rtmp.youtube.com/live2 (port 1935) -> rtmps://a.rtmps.youtube.com:443/live2
+    // if port 1935 is firewalled by the host network.
+    if (!this.config.dryRun) {
+      try {
+        const parsed = new URL(this.config.rtmpUrl);
+        if (parsed.protocol === 'rtmp:' && /youtube\.com$/i.test(parsed.hostname)) {
+          const port = parsed.port ? Number(parsed.port) : 1935;
+          const reachable = await probeTcpReachable(parsed.hostname, port, 1800);
+          if (!reachable) {
+            const tlsReachable = await probeTcpReachable('a.rtmps.youtube.com', 443, 2000);
+            if (tlsReachable) {
+              this.config.rtmpUrl = DEFAULT_YOUTUBE_RTMPS_URL;
+            }
+          }
+        }
+      } catch {
+        // validation already checked URL
+      }
+    }
+
     this.stopInternal(false);
     this.stopRequested = false;
     this.lastError = null;
     this.reconnectAttempts = 0;
+    this.consecutiveWorkerFailures = 0;
     this.loopCount = 0;
     this.currentTrackIndex = 0;
+    this.cumulativeTsOffsetSec = 0;
     this.startedAt = Date.now();
     this.state = 'connecting';
     this.emitStatus();
@@ -194,9 +262,8 @@ export class StreamEngine extends EventEmitter {
     }, 1000);
 
     if (this.config.mode === 'autonomous-24-7') {
-      this.launchNextAutonomousTrack();
+      this.startAutonomousPipeline();
     } else {
-      // Canvas Relay waits for WebSocket binary chunks from browser MediaRecorder
       this.startCanvasRelayProcess();
     }
 
@@ -205,6 +272,23 @@ export class StreamEngine extends EventEmitter {
 
   stop(): void {
     this.stopInternal(true);
+  }
+
+  private killProc(proc: ChildProcess | null): void {
+    if (!proc) return;
+    proc.stdout?.removeAllListeners('data');
+    proc.stderr?.removeAllListeners('data');
+    proc.removeAllListeners('close');
+    try {
+      proc.stdin?.end();
+    } catch {
+      // ignore
+    }
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      // ignore
+    }
   }
 
   private stopInternal(resetToIdle: boolean): void {
@@ -217,29 +301,19 @@ export class StreamEngine extends EventEmitter {
       clearInterval(this.uptimeInterval);
       this.uptimeInterval = null;
     }
-    if (this.activeProc) {
-      const proc = this.activeProc;
-      this.activeProc = null;
-      proc.stderr?.removeAllListeners('data');
-      proc.removeAllListeners('close');
-      try {
-        proc.kill('SIGTERM');
-      } catch {
-        // ignore
-      }
-    }
-    if (this.relayProc) {
-      const proc = this.relayProc;
-      this.relayProc = null;
-      proc.stderr?.removeAllListeners('data');
-      proc.removeAllListeners('close');
-      try {
-        proc.stdin?.end();
-        proc.kill('SIGTERM');
-      } catch {
-        // ignore
-      }
-    }
+
+    const w = this.workerProc;
+    this.workerProc = null;
+    this.killProc(w);
+
+    const m = this.muxerProc;
+    this.muxerProc = null;
+    this.killProc(m);
+
+    const r = this.relayProc;
+    this.relayProc = null;
+    this.killProc(r);
+
     if (resetToIdle) {
       this.state = 'idle';
       this.startedAt = null;
@@ -247,6 +321,7 @@ export class StreamEngine extends EventEmitter {
       this.measuredBitrateKbps = 0;
       this.currentTrackId = null;
       this.currentTrackTitle = '';
+      this.lastError = null;
       this.emitStatus();
     }
   }
@@ -263,24 +338,94 @@ export class StreamEngine extends EventEmitter {
       this.currentTrackIndex = (this.currentTrackIndex + 1) % tracks.length;
     }
 
-    if (this.activeProc) {
-      const proc = this.activeProc;
-      this.activeProc = null;
-      proc.removeAllListeners('close');
-      try {
-        proc.kill('SIGTERM');
-      } catch {
-        // ignore
-      }
+    if (this.workerStartedAt > 0) {
+      const elapsed = Math.max(0.5, (Date.now() - this.workerStartedAt) / 1000);
+      this.cumulativeTsOffsetSec += elapsed + 0.1;
+    }
+
+    if (this.workerProc) {
+      const proc = this.workerProc;
+      this.workerProc = null;
+      this.killProc(proc);
     }
     this.launchNextAutonomousTrack();
   }
 
-  private launchNextAutonomousTrack(): void {
+  private startAutonomousPipeline(): void {
     if (this.stopRequested) return;
+
+    // Master RTMPS Muxer stays connected to YouTube 24/7 across all songs
+    const muxArgs = [
+      '-fflags',
+      '+genpts',
+      '-f',
+      'mpegts',
+      '-i',
+      'pipe:0',
+      '-c:v',
+      'copy',
+      '-c:a',
+      'copy',
+      '-bsf:a',
+      'aac_adtstoasc',
+      ...this.getOutputTargetArgs(),
+    ];
+
+    const muxer = spawn('ffmpeg', muxArgs, { shell: false, stdio: ['pipe', 'ignore', 'pipe'] });
+    this.muxerProc = muxer;
+
+    let stderrTail = '';
+    muxer.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString();
+      stderrTail = (stderrTail + text).slice(-1400);
+      this.parseFfmpegTelemetry(text, 'muxer');
+    });
+
+    muxer.stdin?.on('error', () => {
+      // Handled by muxer close listener
+    });
+
+    muxer.on('close', () => {
+      if (this.muxerProc !== muxer) return;
+      this.muxerProc = null;
+
+      const worker = this.workerProc;
+      this.workerProc = null;
+      this.killProc(worker);
+
+      if (this.stopRequested) return;
+
+      this.lastError = this.sanitizeFfmpegError(stderrTail);
+      if (this.config.autoReconnect) {
+        this.state = 'reconnecting';
+        this.reconnectAttempts += 1;
+        this.cumulativeTsOffsetSec = 0;
+        this.emitStatus();
+        const delayMs = Math.min(15000, 2500 * Math.min(this.reconnectAttempts, 5));
+        this.reconnectTimer = setTimeout(() => {
+          if (!this.stopRequested) {
+            this.startAutonomousPipeline();
+          }
+        }, delayMs);
+      } else {
+        this.state = 'error';
+        this.emitStatus();
+      }
+    });
+
+    this.launchNextAutonomousTrack();
+  }
+
+  private launchNextAutonomousTrack(): void {
+    void this.launchNextAutonomousTrackAsync();
+  }
+
+  private async launchNextAutonomousTrackAsync(): Promise<void> {
+    if (this.stopRequested || !this.muxerProc) return;
     const tracks = this.store.getAll();
     if (tracks.length === 0) {
       this.lastError = 'Playlist is empty. Broadcast stopped.';
+      this.stopInternal(false);
       this.state = 'error';
       this.emitStatus();
       return;
@@ -292,14 +437,15 @@ export class StreamEngine extends EventEmitter {
     }
 
     const track = tracks[this.currentTrackIndex];
+    const nextTrack = tracks.length > 1 ? tracks[(this.currentTrackIndex + 1) % tracks.length] : null;
     const audioPath = resolveSafeAssetPath(track.audioUrl);
     const coverPath = resolveSafeAssetPath(track.coverUrl);
 
     if (!audioPath || !coverPath) {
-      // Skip broken track cleanly and advance loop
       this.currentTrackIndex = (this.currentTrackIndex + 1) % tracks.length;
       if (tracks.length === 1) {
         this.lastError = 'Track audio or cover file missing on server.';
+        this.stopInternal(false);
         this.state = 'error';
         this.emitStatus();
         return;
@@ -310,27 +456,80 @@ export class StreamEngine extends EventEmitter {
 
     this.currentTrackId = track.id;
     this.currentTrackTitle = track.title;
+    this.workerStartedAt = Date.now();
     this.emitStatus();
 
-    const args = this.buildAutonomousFfmpegArgs(track, audioPath, coverPath);
-    const proc = spawn('ffmpeg', args, { shell: false, stdio: ['ignore', 'ignore', 'pipe'] });
-    this.activeProc = proc;
+    let bundle: GlassRenderBundle | null = null;
+    try {
+      bundle = await generateGlassRenderBundle({
+        track,
+        nextTrack,
+        trackIndex: this.currentTrackIndex,
+        totalTracks: tracks.length,
+        coverPath,
+        resolution: this.config.resolution,
+        visuals: this.config.visuals,
+        dryRun: this.config.dryRun,
+      });
+    } catch (err) {
+      console.error('Glass frame generation failed:', err);
+      bundle = null;
+    }
 
-    let stderrTail = '';
-    proc.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
-      stderrTail = (stderrTail + text).slice(-1200);
-      this.parseFfmpegTelemetry(text);
+    if (this.stopRequested || !this.muxerProc) {
+      cleanupGlassRenderBundle(bundle?.dir);
+      return;
+    }
+
+    if (!bundle) {
+      this.consecutiveWorkerFailures += 1;
+      this.lastError = 'Failed to compose glassmorphic frame for track.';
+      if (this.consecutiveWorkerFailures >= Math.max(3, tracks.length)) {
+        this.stopInternal(false);
+        this.state = 'error';
+        this.emitStatus();
+        return;
+      }
+      this.currentTrackIndex = (this.currentTrackIndex + 1) % tracks.length;
+      setTimeout(() => this.launchNextAutonomousTrack(), 300);
+      return;
+    }
+
+    const args = this.buildWorkerMpegTsArgs(track, audioPath, bundle, this.cumulativeTsOffsetSec);
+    const worker = spawn('ffmpeg', args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    this.workerProc = worker;
+
+    let workerStderr = '';
+    let workerProducedBytes = false;
+    worker.stdout?.on('data', (chunk: Buffer) => {
+      if (!workerProducedBytes && chunk.length > 0) {
+        workerProducedBytes = true;
+        this.consecutiveWorkerFailures = 0;
+      }
+      const stdin = this.muxerProc?.stdin;
+      if (stdin && !stdin.destroyed && stdin.writable) {
+        stdin.write(chunk);
+      }
     });
 
-    proc.on('close', (code) => {
-      if (this.activeProc !== proc) return;
-      this.activeProc = null;
-      if (this.stopRequested) return;
+    worker.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString();
+      workerStderr = (workerStderr + text).slice(-1200);
+      this.parseFfmpegTelemetry(text, 'worker');
+    });
+
+    worker.on('close', (code) => {
+      cleanupGlassRenderBundle(bundle?.dir);
+      if (this.workerProc !== worker) return;
+      this.workerProc = null;
+      if (this.stopRequested || !this.muxerProc) return;
+
+      const elapsed = Math.max(1, (Date.now() - this.workerStartedAt) / 1000);
+      this.cumulativeTsOffsetSec += Math.max(track.durationSec || elapsed, elapsed) + 0.05;
 
       if (code === 0) {
-        // Track finished normally -> advance sequentially in infinite lifetime loop!
         this.reconnectAttempts = 0;
+        this.consecutiveWorkerFailures = 0;
         const nextIdx = this.currentTrackIndex + 1;
         if (nextIdx >= tracks.length) {
           this.loopCount += 1;
@@ -340,65 +539,64 @@ export class StreamEngine extends EventEmitter {
         }
         this.launchNextAutonomousTrack();
       } else {
-        // RTMP drop or encoding interruption
-        const sanitizedMsg = this.sanitizeFfmpegError(stderrTail);
-        this.lastError = sanitizedMsg;
-        if (this.config.autoReconnect) {
-          this.state = 'reconnecting';
-          this.reconnectAttempts += 1;
-          this.emitStatus();
-          const delayMs = Math.min(15000, 2000 * Math.min(this.reconnectAttempts, 5));
-          this.reconnectTimer = setTimeout(() => {
-            if (!this.stopRequested) {
-              this.launchNextAutonomousTrack();
-            }
-          }, delayMs);
-        } else {
+        this.consecutiveWorkerFailures += 1;
+        this.lastError = this.sanitizeFfmpegError(workerStderr);
+        if (this.consecutiveWorkerFailures >= Math.max(3, tracks.length)) {
+          this.stopInternal(false);
           this.state = 'error';
           this.emitStatus();
+          return;
         }
+        // Track decode failure — skip to next track without dropping YouTube stream!
+        this.currentTrackIndex = (this.currentTrackIndex + 1) % tracks.length;
+        setTimeout(() => this.launchNextAutonomousTrack(), 300);
       }
     });
   }
 
-  private buildAutonomousFfmpegArgs(track: PhonkTrack, audioPath: string, coverPath: string): string[] {
-    const [w, h] = this.config.resolution === '1920x1080' ? [1920, 1080] : [1280, 720];
-    const scaleFactor = w / 1280;
-    const cardW = Math.round(920 * scaleFactor);
-    const cardH = Math.round(440 * scaleFactor);
-    const cardX = Math.round((w - cardW) / 2);
-    const cardY = Math.round((h - cardH) / 2 - 16 * scaleFactor);
-    const artSize = Math.round(320 * scaleFactor);
-    const artX = Math.round(cardX + 48 * scaleFactor);
-    const artY = Math.round(cardY + (cardH - artSize) / 2);
-    const textX = Math.round(artX + artSize + 44 * scaleFactor);
-    const barY = Math.round(h - 76 * scaleFactor);
+  private buildWorkerMpegTsArgs(
+    track: PhonkTrack,
+    audioPath: string,
+    bundle: GlassRenderBundle,
+    tsOffsetSec: number
+  ): string[] {
+    const {
+      w,
+      specX,
+      specY,
+      specW,
+      specH,
+      progX,
+      progY,
+      progW,
+      timeX,
+      timeY,
+      timeFontSize,
+      knobSize,
+      knobY,
+      visualizerStyle,
+    } = bundle.layout;
+    const s = w / 1280;
+    const maskTop = Math.max(0, progY - Math.round(8 * s));
+    const dur = Math.max(1, Math.round(track.durationSec || 60));
     const accentHex = track.palette.accent.replace('#', '0x');
     const primaryHex = track.palette.primary.replace('#', '0x');
-
-    const titleEsc = escapeDrawtext(track.title);
-    const artistEsc = escapeDrawtext(`${track.artist}  ·  ${track.subgenre}`);
-    const totalTimeEsc = escapeDrawtext(formatTimeMMSS(track.durationSec));
     const fontArg = this.fontPath ? `fontfile=${this.fontPath}:` : '';
 
-    // Build glassmorphic FFmpeg filtergraph:
-    // 1. Blurred, darkened cover art backdrop
-    // 2. Frosted dark glass center panel with subtle cover-tinted hairline border
-    // 3. Crisp square cover art inside the glass panel
-    // 4. Real-time audio spectrum bar blended inside the glass card
-    // 5. Track title, artist, live label, and bottom MM:SS / MM:SS timer
+    const spectrumFilter =
+      visualizerStyle === 'mirror'
+        ? `[5:a]showfreqs=s=${specW}x${Math.max(20, Math.floor(specH / 2))}:mode=bar:fscale=log:colors=${accentHex}|${primaryHex},fps=${this.config.fps},split[spt][spb];[spb]vflip[spbf];[spt][spbf]vstack[spec_raw]`
+        : `[5:a]showfreqs=s=${specW}x${specH}:mode=bar:fscale=log:colors=${accentHex}|${primaryHex},fps=${this.config.fps}[spec_raw]`;
+
+    const knobOffset = Math.round(knobSize / 2);
     const filters = [
-      `[0:v]scale=320:180:force_original_aspect_ratio=increase,crop=320:180,boxblur=10:2,scale=${w}:${h}:flags=bilinear,eq=brightness=-0.18:saturation=1.25[bg]`,
-      `[bg]drawbox=x=${cardX}:y=${cardY}:w=${cardW}:h=${cardH}:color=0x0c0e14@0.58:t=fill,drawbox=x=${cardX}:y=${cardY}:w=${cardW}:h=${cardH}:color=${accentHex}@0.42:t=2[glass]`,
-      `[0:v]scale=${artSize}:${artSize}:force_original_aspect_ratio=increase,crop=${artSize}:${artSize}[art]`,
-      `[glass][art]overlay=${artX}:${artY}[with_art]`,
-      `[1:a]showfreqs=s=${Math.round(460 * scaleFactor)}x${Math.round(90 * scaleFactor)}:mode=bar:fscale=log:colors=${accentHex}|${primaryHex}[spec]`,
-      `[with_art][spec]overlay=${textX}:${Math.round(artY + artSize - 102 * scaleFactor)}[with_spec]`,
-      `[with_spec]drawbox=x=${cardX}:y=${barY}:w=${cardW}:h=${Math.round(4 * scaleFactor)}:color=0xffffff@0.16:t=fill` +
-        `,drawtext=${fontArg}text='PHONK 24/7 LIVE':x=${textX}:y=${artY + 10}:fontsize=${Math.round(16 * scaleFactor)}:fontcolor=${accentHex}` +
-        `,drawtext=${fontArg}text='${titleEsc}':x=${textX}:y=${Math.round(artY + 46 * scaleFactor)}:fontsize=${Math.round(38 * scaleFactor)}:fontcolor=0xffffff` +
-        `,drawtext=${fontArg}text='${artistEsc}':x=${textX}:y=${Math.round(artY + 100 * scaleFactor)}:fontsize=${Math.round(20 * scaleFactor)}:fontcolor=0xd4d4d8` +
-        `,drawtext=${fontArg}text='%{pts\\:hms} / ${totalTimeEsc}':x=${cardX}:y=${Math.round(barY - 34 * scaleFactor)}:fontsize=${Math.round(22 * scaleFactor)}:fontcolor=0xffffff[vout]`,
+      spectrumFilter,
+      `[0:v][spec_raw]overlay=${specX}:${specY}[with_spec]`,
+      `[with_spec][1:v]overlay=${specX}:${specY}[with_bars]`,
+      `[with_bars][2:v]overlay=x='${progX}-${progW}+trunc(${progW}*min(1\\,t/${dur}))':y=${progY}[with_prog]`,
+      `[with_prog][3:v]overlay=x=0:y=${maskTop}[with_prog_masked]`,
+      `[with_prog_masked][4:v]overlay=x='${progX}+trunc(${progW}*min(1\\,t/${dur}))-${knobOffset}':y=${knobY}[with_knob]`,
+      `[with_knob]drawtext=${fontArg}text='%{eif\\:trunc(t/60)\\:d\\:2}\\:%{eif\\:mod(trunc(t)\\,60)\\:d\\:2}':x=${timeX}:y=${timeY}:fontsize=${timeFontSize}:fontcolor=0xffffff,format=yuv420p[vout]`,
     ].join(';');
 
     const gop = this.config.fps * 2;
@@ -409,7 +607,16 @@ export class StreamEngine extends EventEmitter {
       '-loop',
       '1',
       '-i',
-      coverPath,
+      bundle.stagePath,
+      '-i',
+      bundle.specOverlayPath,
+      '-i',
+      bundle.barFillPath,
+      '-i',
+      bundle.dockLeftMaskPath,
+      '-i',
+      bundle.knobPath,
+      '-re',
       '-i',
       audioPath,
       '-filter_complex',
@@ -417,11 +624,11 @@ export class StreamEngine extends EventEmitter {
       '-map',
       '[vout]',
       '-map',
-      '1:a',
+      '5:a',
       '-c:v',
       'libx264',
       '-preset',
-      'superfast',
+      'ultrafast',
       '-tune',
       'stillimage',
       '-pix_fmt',
@@ -430,6 +637,10 @@ export class StreamEngine extends EventEmitter {
       String(this.config.fps),
       '-g',
       String(gop),
+      '-keyint_min',
+      String(gop),
+      '-sc_threshold',
+      '0',
       '-b:v',
       `${this.config.videoBitrateKbps}k`,
       '-maxrate',
@@ -445,7 +656,11 @@ export class StreamEngine extends EventEmitter {
       '-ac',
       '2',
       '-shortest',
-      ...this.getOutputTargetArgs(),
+      '-output_ts_offset',
+      tsOffsetSec.toFixed(2),
+      '-f',
+      'mpegts',
+      'pipe:1',
     ];
   }
 
@@ -459,7 +674,7 @@ export class StreamEngine extends EventEmitter {
       '-c:v',
       'libx264',
       '-preset',
-      'veryfast',
+      'superfast',
       '-tune',
       'zerolatency',
       '-pix_fmt',
@@ -468,6 +683,10 @@ export class StreamEngine extends EventEmitter {
       String(this.config.fps),
       '-g',
       String(gop),
+      '-keyint_min',
+      String(gop),
+      '-sc_threshold',
+      '0',
       '-b:v',
       `${this.config.videoBitrateKbps}k`,
       '-maxrate',
@@ -491,8 +710,8 @@ export class StreamEngine extends EventEmitter {
 
     proc.stderr?.on('data', (chunk: Buffer) => {
       const text = chunk.toString();
-      stderrTail = (stderrTail + text).slice(-1200);
-      this.parseFfmpegTelemetry(text);
+      stderrTail = (stderrTail + text).slice(-1400);
+      this.parseFfmpegTelemetry(text, 'relay');
     });
 
     proc.on('close', (code) => {
@@ -517,31 +736,58 @@ export class StreamEngine extends EventEmitter {
     }
   }
 
-  private parseFfmpegTelemetry(text: string): void {
+  private parseFfmpegTelemetry(text: string, source: 'muxer' | 'worker' | 'relay'): void {
     if (this.stopRequested || this.state === 'idle') return;
+    const frameMatch = text.match(/frame=\s*(\d+)/);
     const fpsMatch = text.match(/fps=\s*([\d.]+)/);
     const bitrateMatch = text.match(/bitrate=\s*([\d.]+)kbits\/s/);
-    if (fpsMatch || bitrateMatch) {
-      if (this.state !== 'live') {
-        this.state = 'live';
+    if (!frameMatch && !fpsMatch && !bitrateMatch) return;
+
+    let changed = false;
+    if (fpsMatch) {
+      const parsedFps = Math.round(Number.parseFloat(fpsMatch[1]));
+      if (parsedFps > 0 && parsedFps !== this.measuredFps) {
+        this.measuredFps = parsedFps;
+        changed = true;
       }
-      if (fpsMatch) this.measuredFps = Math.round(Number.parseFloat(fpsMatch[1]));
-      if (bitrateMatch) this.measuredBitrateKbps = Math.round(Number.parseFloat(bitrateMatch[1]));
+    }
+    if (bitrateMatch) {
+      const parsedBr = Math.round(Number.parseFloat(bitrateMatch[1]));
+      if (parsedBr > 0 && parsedBr !== this.measuredBitrateKbps) {
+        this.measuredBitrateKbps = parsedBr;
+        changed = true;
+      }
+    }
+
+    const canConfirmLive = this.config.dryRun ? true : source !== 'worker';
+    const hasFrames = (frameMatch && Number.parseInt(frameMatch[1], 10) >= 2) || this.measuredBitrateKbps > 0 || this.measuredFps > 0;
+    if (canConfirmLive && hasFrames && this.state !== 'live') {
+      this.state = 'live';
+      this.lastError = null;
+      changed = true;
+    }
+
+    if (changed) {
       this.emitStatus();
     }
   }
 
   private sanitizeFfmpegError(raw: string): string {
-    // Strip any stream key from error text before surfacing to UI
     let cleaned = raw;
     if (this.streamKey) {
       cleaned = cleaned.split(this.streamKey).join('***');
+    }
+    if (/Error in the pull function|Input\/output error|End of file|Broken pipe|NetStream\.Publish/i.test(cleaned) && /rtmps?:\/\//i.test(cleaned)) {
+      return 'YouTube rejected or closed the RTMPS stream. Make sure YouTube Studio -> Go Live is open and your Stream Key matches.';
+    }
+    if (/Connection timed out/i.test(cleaned)) {
+      return 'RTMP connection timed out. Use rtmps://a.rtmps.youtube.com:443/live2 (Port 443 RTMPS).';
     }
     const lines = cleaned
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean);
-    const errLine = [...lines].reverse().find((l) => /error|failed|refused|timed out|invalid/i.test(l));
+    const errLine = [...lines].reverse().find((l) => /error|failed|refused|timed out|invalid|not found/i.test(l));
     return errLine ? errLine.slice(0, 180) : 'FFmpeg broadcast stream disconnected.';
   }
 }

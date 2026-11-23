@@ -246,9 +246,20 @@ export function BroadcastPanel({
 
           {/* RTMP Server URL */}
           <div>
-            <label htmlFor="yt-rtmp-url" className="block text-xs font-medium text-zinc-300">
-              YouTube RTMP Ingest URL
-            </label>
+            <div className="flex items-center justify-between gap-2">
+              <label htmlFor="yt-rtmp-url" className="block text-xs font-medium text-zinc-300">
+                YouTube Ingest URL (RTMPS / RTMP)
+              </label>
+              {!isBroadcasting && (
+                <button
+                  type="button"
+                  onClick={() => setRtmpUrlInput('rtmps://a.rtmps.youtube.com:443/live2')}
+                  className="text-[11px] text-zinc-400 underline hover:text-white"
+                >
+                  Use Port 443 RTMPS
+                </button>
+              )}
+            </div>
             <input
               id="yt-rtmp-url"
               type="url"

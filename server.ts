@@ -285,26 +285,33 @@ async function bootstrap() {
     if (typeof body.autoReconnect === 'boolean') patch.autoReconnect = body.autoReconnect;
     if (body.mode === 'autonomous-24-7' || body.mode === 'canvas-relay') patch.mode = body.mode;
     if (typeof body.dryRun === 'boolean') patch.dryRun = body.dryRun;
+    if (body.visuals && typeof body.visuals === 'object') patch.visuals = body.visuals;
 
     const config = engine.updateConfig(patch);
     res.json({ status: engine.getStatus(), config });
   });
 
-  app.post('/api/stream/start', (req, res) => {
+  app.post('/api/stream/start', async (req, res) => {
     const body = req.body || {};
     if (typeof body.streamKey === 'string' && body.streamKey.trim()) {
       engine.setStreamKey(body.streamKey);
     }
-    if (typeof body.rtmpUrl === 'string' || typeof body.dryRun === 'boolean' || body.mode) {
+    if (
+      typeof body.rtmpUrl === 'string' ||
+      typeof body.dryRun === 'boolean' ||
+      body.mode ||
+      body.visuals
+    ) {
       engine.updateConfig({
         ...(typeof body.rtmpUrl === 'string' ? { rtmpUrl: body.rtmpUrl } : {}),
         ...(typeof body.dryRun === 'boolean' ? { dryRun: body.dryRun } : {}),
         ...(body.mode === 'autonomous-24-7' || body.mode === 'canvas-relay'
           ? { mode: body.mode }
           : {}),
+        ...(body.visuals && typeof body.visuals === 'object' ? { visuals: body.visuals } : {}),
       });
     }
-    const result = engine.start();
+    const result = await engine.start();
     if (!result.ok) {
       res.status(400).json({ error: result.error, status: engine.getStatus() });
       return;

@@ -6,6 +6,7 @@ import { LiveGlassScreen } from './components/LiveGlassScreen';
 import { PlaylistQueue } from './components/PlaylistQueue';
 import { usePhonkPlayer } from './hooks/usePhonkPlayer';
 import {
+  DEFAULT_YOUTUBE_RTMPS_URL,
   reorderTracks,
   type AudioFxSettings,
   type PhonkTrack,
@@ -21,7 +22,7 @@ const INITIAL_STATUS: StreamStatus = {
   dryRun: false,
   hasStreamKey: false,
   maskedStreamKey: '',
-  rtmpUrl: 'rtmp://a.rtmp.youtube.com/live2',
+  rtmpUrl: DEFAULT_YOUTUBE_RTMPS_URL,
   startedAt: null,
   uptimeSec: 0,
   currentTrackId: null,
@@ -35,7 +36,7 @@ const INITIAL_STATUS: StreamStatus = {
 };
 
 const INITIAL_CONFIG: StreamConfig = {
-  rtmpUrl: 'rtmp://a.rtmp.youtube.com/live2',
+  rtmpUrl: DEFAULT_YOUTUBE_RTMPS_URL,
   resolution: '1280x720',
   fps: 30,
   videoBitrateKbps: 4500,
@@ -244,6 +245,12 @@ export default function App() {
     dryRun: boolean;
   }) => {
     setStreamActionError(null);
+    setStreamConfig((prev) => ({
+      ...prev,
+      rtmpUrl: payload.rtmpUrl,
+      mode: payload.mode,
+      dryRun: payload.dryRun,
+    }));
     try {
       // Ensure audio preview plays in Canvas Relay mode
       if (payload.mode === 'canvas-relay' && !player.isPlaying && tracks.length > 0) {
@@ -252,7 +259,7 @@ export default function App() {
       const res = await fetch('/api/stream/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, visuals }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -260,7 +267,12 @@ export default function App() {
         if (data?.status) setStreamStatus(data.status);
         return;
       }
-      if (data.status) setStreamStatus(data.status);
+      if (data.status) {
+        setStreamStatus(data.status);
+        if (typeof data.status.rtmpUrl === 'string') {
+          setStreamConfig((prev) => ({ ...prev, rtmpUrl: data.status.rtmpUrl }));
+        }
+      }
     } catch {
       setStreamActionError('Network error starting broadcast.');
     }
@@ -447,7 +459,10 @@ export default function App() {
               onStartBroadcast={handleStartBroadcast}
               onStopBroadcast={handleStopBroadcast}
               onChangeFx={setFx}
-              onChangeVisuals={setVisuals}
+              onChangeVisuals={(nextVisuals) => {
+                setVisuals(nextVisuals);
+                void handleUpdateConfig({ visuals: nextVisuals });
+              }}
               streamActionError={streamActionError}
             />
           </div>

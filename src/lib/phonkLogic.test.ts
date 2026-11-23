@@ -90,4 +90,8 @@ test('validateRtmpTarget enforces protocol, key hygiene, and SSRF protection', (
   const ok = validateRtmpTarget('rtmp://a.rtmp.youtube.com/live2', 'abcd-1234-efgh-5678', false);
   assert.equal(ok.valid, true);
   assert.equal(ok.sanitizedHost, 'a.rtmp.youtube.com');
+
+  const okRtmps = validateRtmpTarget('rtmps://a.rtmps.youtube.com:443/live2', 'abcd-1234-efgh-5678', false);
+  assert.equal(okRtmps.valid, true);
+  assert.equal(okRtmps.sanitizedHost, 'a.rtmps.youtube.com');
 });
