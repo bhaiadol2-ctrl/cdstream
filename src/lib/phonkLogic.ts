@@ -22,7 +22,23 @@ export interface PhonkTrack {
   createdAt: number;
 }
 
-export type StreamMode = 'autonomous-24-7' | 'canvas-relay';
+export interface VideoItem {
+  id: string;
+  title: string;
+  videoUrl: string;
+  thumbnailUrl: string;
+  durationSec: number;
+  width: number;
+  height: number;
+  fileSizeBytes: number;
+  videoCodec: string;
+  audioCodec: string;
+  hasAudio: boolean;
+  createdAt: number;
+}
+
+export type StreamMode = 'video-24-7' | 'autonomous-24-7' | 'canvas-relay';
+export type VideoEncodeMode = 'safe-encode' | 'direct-copy';
 export type VisualizerStyle = 'bars' | 'mirror' | 'ring';
 export type StreamState = 'idle' | 'connecting' | 'live' | 'reconnecting' | 'error';
 
@@ -34,6 +50,7 @@ export interface StreamConfig {
   audioBitrateKbps: number;
   autoReconnect: boolean;
   mode: StreamMode;
+  videoEncodeMode?: VideoEncodeMode;
   dryRun: boolean;
   visuals?: VisualSettings;
 }
@@ -105,6 +122,26 @@ export function formatTimeMMSS(seconds: number): string {
     return `${String(hrs).padStart(2, '0')}:${mm}:${ss}`;
   }
   return `${mm}:${ss}`;
+}
+
+export function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 MB';
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1024) {
+    return `${(mb / 1024).toFixed(2)} GB`;
+  }
+  if (mb >= 10) {
+    return `${Math.round(mb)} MB`;
+  }
+  return `${mb.toFixed(1)} MB`;
+}
+
+export function isDirectCopyCompatibleVideo(
+  video: Pick<VideoItem, 'videoCodec' | 'audioCodec' | 'hasAudio'>
+): boolean {
+  const vOk = video.videoCodec.toLowerCase() === 'h264';
+  const aOk = video.hasAudio && video.audioCodec.toLowerCase() === 'aac';
+  return vOk && aOk;
 }
 
 export function formatUptimeHHMMSS(seconds: number): string {

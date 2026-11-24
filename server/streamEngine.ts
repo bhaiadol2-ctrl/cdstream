@@ -12,6 +12,8 @@ import {
   type StreamMode,
   type StreamState,
   type StreamStatus,
+  type VideoEncodeMode,
+  type VideoItem,
   type VisualSettings,
 } from '../src/lib/phonkLogic.ts';
 import {
@@ -20,6 +22,7 @@ import {
   type GlassRenderBundle,
 } from './glassFrameGenerator.ts';
 import { resolveSafeAssetPath, type TrackStore } from './trackStore.ts';
+import { type VideoStore } from './videoStore.ts';
 
 const FONT_CANDIDATES = [
   '/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-SemiBold.ttf',
@@ -53,6 +56,7 @@ function probeTcpReachable(host: string, port: number, timeoutMs = 1800): Promis
 
 export class StreamEngine extends EventEmitter {
   private store: TrackStore;
+  private videoStore: VideoStore;
   private streamKey = '';
   private config: StreamConfig = {
     rtmpUrl: DEFAULT_YOUTUBE_RTMPS_URL,
@@ -61,7 +65,8 @@ export class StreamEngine extends EventEmitter {
     videoBitrateKbps: 4500,
     audioBitrateKbps: 192,
     autoReconnect: true,
-    mode: 'autonomous-24-7',
+    mode: 'video-24-7',
+    videoEncodeMode: 'safe-encode',
     dryRun: false,
     visuals: { ...DEFAULT_VISUAL_SETTINGS },
   };
@@ -88,9 +93,10 @@ export class StreamEngine extends EventEmitter {
   private uptimeInterval: NodeJS.Timeout | null = null;
   private fontPath: string | null;
 
-  constructor(store: TrackStore) {
+  constructor(store: TrackStore, videoStore: VideoStore) {
     super();
     this.store = store;
+    this.videoStore = videoStore;
     this.fontPath = findSystemFont();
   }
 
@@ -126,8 +132,11 @@ export class StreamEngine extends EventEmitter {
     if (typeof patch.autoReconnect === 'boolean') {
       this.config.autoReconnect = patch.autoReconnect;
     }
-    if (patch.mode === 'autonomous-24-7' || patch.mode === 'canvas-relay') {
+    if (patch.mode === 'video-24-7' || patch.mode === 'autonomous-24-7' || patch.mode === 'canvas-relay') {
       this.config.mode = patch.mode;
+    }
+    if (patch.videoEncodeMode === 'safe-encode' || patch.videoEncodeMode === 'direct-copy') {
+      this.config.videoEncodeMode = patch.videoEncodeMode;
     }
     if (typeof patch.dryRun === 'boolean') {
       this.config.dryRun = patch.dryRun;
@@ -215,6 +224,13 @@ export class StreamEngine extends EventEmitter {
     }
 
     const tracks = this.store.getAll();
+    const videos = this.videoStore.getAll();
+    if (this.config.mode === 'video-24-7' && videos.length === 0) {
+      this.lastError = 'Upload at least one video file before starting the 24/7 video live stream.';
+      this.state = 'error';
+      this.emitStatus();
+      return { ok: false, error: this.lastError };
+    }
     if (this.config.mode === 'autonomous-24-7' && tracks.length === 0) {
       this.lastError = 'Add at least one Phonk track before starting the 24/7 broadcast.';
       this.state = 'error';
@@ -261,7 +277,7 @@ export class StreamEngine extends EventEmitter {
       }
     }, 1000);
 
-    if (this.config.mode === 'autonomous-24-7') {
+    if (this.config.mode === 'autonomous-24-7' || this.config.mode === 'video-24-7') {
       this.startAutonomousPipeline();
     } else {
       this.startCanvasRelayProcess();
@@ -327,15 +343,20 @@ export class StreamEngine extends EventEmitter {
   }
 
   skipTrack(trackId?: string): void {
-    if (this.config.mode !== 'autonomous-24-7' || this.state === 'idle') return;
-    const tracks = this.store.getAll();
-    if (tracks.length === 0) return;
+    if (
+      (this.config.mode !== 'autonomous-24-7' && this.config.mode !== 'video-24-7') ||
+      this.state === 'idle'
+    ) {
+      return;
+    }
+    const items = this.config.mode === 'video-24-7' ? this.videoStore.getAll() : this.store.getAll();
+    if (items.length === 0) return;
 
     if (trackId) {
-      const idx = tracks.findIndex((t) => t.id === trackId);
+      const idx = items.findIndex((t) => t.id === trackId);
       if (idx !== -1) this.currentTrackIndex = idx;
     } else {
-      this.currentTrackIndex = (this.currentTrackIndex + 1) % tracks.length;
+      this.currentTrackIndex = (this.currentTrackIndex + 1) % items.length;
     }
 
     if (this.workerStartedAt > 0) {
@@ -348,7 +369,7 @@ export class StreamEngine extends EventEmitter {
       this.workerProc = null;
       this.killProc(proc);
     }
-    this.launchNextAutonomousTrack();
+    this.launchNextPipelineItem();
   }
 
   private startAutonomousPipeline(): void {
@@ -413,7 +434,278 @@ export class StreamEngine extends EventEmitter {
       }
     });
 
-    this.launchNextAutonomousTrack();
+    this.launchNextPipelineItem();
+  }
+
+  private launchNextPipelineItem(): void {
+    if (this.config.mode === 'video-24-7') {
+      this.launchNextVideoFile();
+    } else {
+      void this.launchNextAutonomousTrackAsync();
+    }
+  }
+
+  private launchNextVideoFile(): void {
+    if (this.stopRequested || !this.muxerProc) return;
+    const videos = this.videoStore.getAll();
+    if (videos.length === 0) {
+      this.lastError = 'Video queue is empty. Broadcast stopped.';
+      this.stopInternal(false);
+      this.state = 'error';
+      this.emitStatus();
+      return;
+    }
+
+    if (this.currentTrackIndex >= videos.length) {
+      this.currentTrackIndex = 0;
+      this.loopCount += 1;
+    }
+
+    const video = videos[this.currentTrackIndex];
+    const videoPath = resolveSafeAssetPath(video.videoUrl);
+
+    if (!videoPath) {
+      this.currentTrackIndex = (this.currentTrackIndex + 1) % videos.length;
+      if (videos.length === 1) {
+        this.lastError = 'Uploaded video file is missing on server.';
+        this.stopInternal(false);
+        this.state = 'error';
+        this.emitStatus();
+        return;
+      }
+      setTimeout(() => this.launchNextVideoFile(), 250);
+      return;
+    }
+
+    this.currentTrackId = video.id;
+    this.currentTrackTitle = video.title;
+    this.workerStartedAt = Date.now();
+    this.emitStatus();
+
+    const args = this.buildVideoWorkerMpegTsArgs(video, videoPath, this.cumulativeTsOffsetSec);
+    const worker = spawn('ffmpeg', args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    this.workerProc = worker;
+
+    let workerStderr = '';
+    let workerProducedBytes = false;
+    worker.stdout?.on('data', (chunk: Buffer) => {
+      if (!workerProducedBytes && chunk.length > 0) {
+        workerProducedBytes = true;
+        this.consecutiveWorkerFailures = 0;
+      }
+      const stdin = this.muxerProc?.stdin;
+      if (stdin && !stdin.destroyed && stdin.writable) {
+        stdin.write(chunk);
+      }
+    });
+
+    worker.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString();
+      workerStderr = (workerStderr + text).slice(-1200);
+      this.parseFfmpegTelemetry(text, 'worker');
+    });
+
+    worker.on('close', (code) => {
+      if (this.workerProc !== worker) return;
+      this.workerProc = null;
+      if (this.stopRequested || !this.muxerProc) return;
+
+      const elapsed = Math.max(1, (Date.now() - this.workerStartedAt) / 1000);
+      this.cumulativeTsOffsetSec += Math.max(video.durationSec || elapsed, elapsed) + 0.05;
+
+      if (code === 0) {
+        this.reconnectAttempts = 0;
+        this.consecutiveWorkerFailures = 0;
+        const nextIdx = this.currentTrackIndex + 1;
+        if (nextIdx >= videos.length) {
+          this.loopCount += 1;
+          this.currentTrackIndex = 0;
+        } else {
+          this.currentTrackIndex = nextIdx;
+        }
+        this.launchNextVideoFile();
+      } else {
+        this.consecutiveWorkerFailures += 1;
+        this.lastError = this.sanitizeFfmpegError(workerStderr);
+        if (this.consecutiveWorkerFailures >= Math.max(3, videos.length)) {
+          this.stopInternal(false);
+          this.state = 'error';
+          this.emitStatus();
+          return;
+        }
+        this.currentTrackIndex = (this.currentTrackIndex + 1) % videos.length;
+        setTimeout(() => this.launchNextVideoFile(), 300);
+      }
+    });
+  }
+
+  private buildVideoWorkerMpegTsArgs(
+    video: VideoItem,
+    videoPath: string,
+    tsOffsetSec: number
+  ): string[] {
+    const encodeMode: VideoEncodeMode = this.config.videoEncodeMode || 'safe-encode';
+    const [w, h] = this.config.resolution === '1920x1080' ? [1920, 1080] : [1280, 720];
+    const gop = this.config.fps * 2;
+    const canCopyVideo = encodeMode === 'direct-copy' && video.videoCodec.toLowerCase() === 'h264';
+
+    if (canCopyVideo) {
+      if (video.hasAudio) {
+        const audioArgs =
+          video.audioCodec.toLowerCase() === 'aac'
+            ? ['-c:a', 'copy']
+            : ['-c:a', 'aac', '-b:a', `${this.config.audioBitrateKbps}k`, '-ar', '44100', '-ac', '2'];
+        return [
+          '-re',
+          '-i',
+          videoPath,
+          '-map',
+          '0:v:0',
+          '-map',
+          '0:a:0',
+          '-c:v',
+          'copy',
+          '-bsf:v',
+          'h264_mp4toannexb',
+          ...audioArgs,
+          '-output_ts_offset',
+          tsOffsetSec.toFixed(2),
+          '-f',
+          'mpegts',
+          'pipe:1',
+        ];
+      }
+      return [
+        '-re',
+        '-i',
+        videoPath,
+        '-f',
+        'lavfi',
+        '-i',
+        'anullsrc=r=44100:cl=stereo',
+        '-map',
+        '0:v:0',
+        '-map',
+        '1:a:0',
+        '-c:v',
+        'copy',
+        '-bsf:v',
+        'h264_mp4toannexb',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-ar',
+        '44100',
+        '-ac',
+        '2',
+        '-shortest',
+        '-output_ts_offset',
+        tsOffsetSec.toFixed(2),
+        '-f',
+        'mpegts',
+        'pipe:1',
+      ];
+    }
+
+    const scalePadFilter = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=#08090d,setsar=1,format=yuv420p`;
+
+    if (video.hasAudio) {
+      return [
+        '-re',
+        '-i',
+        videoPath,
+        '-vf',
+        scalePadFilter,
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a:0',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-pix_fmt',
+        'yuv420p',
+        '-r',
+        String(this.config.fps),
+        '-g',
+        String(gop),
+        '-keyint_min',
+        String(gop),
+        '-sc_threshold',
+        '0',
+        '-b:v',
+        `${this.config.videoBitrateKbps}k`,
+        '-maxrate',
+        `${this.config.videoBitrateKbps}k`,
+        '-bufsize',
+        `${this.config.videoBitrateKbps * 2}k`,
+        '-c:a',
+        'aac',
+        '-b:a',
+        `${this.config.audioBitrateKbps}k`,
+        '-ar',
+        '44100',
+        '-ac',
+        '2',
+        '-output_ts_offset',
+        tsOffsetSec.toFixed(2),
+        '-f',
+        'mpegts',
+        'pipe:1',
+      ];
+    }
+
+    return [
+      '-re',
+      '-i',
+      videoPath,
+      '-f',
+      'lavfi',
+      '-i',
+      'anullsrc=r=44100:cl=stereo',
+      '-vf',
+      scalePadFilter,
+      '-map',
+      '0:v:0',
+      '-map',
+      '1:a:0',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-pix_fmt',
+      'yuv420p',
+      '-r',
+      String(this.config.fps),
+      '-g',
+      String(gop),
+      '-keyint_min',
+      String(gop),
+      '-sc_threshold',
+      '0',
+      '-b:v',
+      `${this.config.videoBitrateKbps}k`,
+      '-maxrate',
+      `${this.config.videoBitrateKbps}k`,
+      '-bufsize',
+      `${this.config.videoBitrateKbps * 2}k`,
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-ar',
+      '44100',
+      '-ac',
+      '2',
+      '-shortest',
+      '-output_ts_offset',
+      tsOffsetSec.toFixed(2),
+      '-f',
+      'mpegts',
+      'pipe:1',
+    ];
   }
 
   private launchNextAutonomousTrack(): void {

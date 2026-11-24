@@ -21,6 +21,7 @@ import {
 } from '../lib/phonkLogic';
 
 interface BroadcastPanelProps {
+  studioMode: 'video' | 'phonk';
   streamStatus: StreamStatus;
   streamConfig: StreamConfig;
   fx: AudioFxSettings;
@@ -32,6 +33,7 @@ interface BroadcastPanelProps {
     streamKey: string;
     rtmpUrl: string;
     mode: StreamMode;
+    videoEncodeMode?: 'safe-encode' | 'direct-copy';
     dryRun: boolean;
   }) => Promise<void>;
   onStopBroadcast: () => Promise<void>;
@@ -41,6 +43,7 @@ interface BroadcastPanelProps {
 }
 
 export function BroadcastPanel({
+  studioMode,
   streamStatus,
   streamConfig,
   fx,
@@ -68,16 +71,25 @@ export function BroadcastPanel({
     streamStatus.state === 'connecting' ||
     streamStatus.state === 'reconnecting';
 
+  const encodeMode = streamConfig.videoEncodeMode || 'safe-encode';
+
   const handleToggleBroadcast = async () => {
     setBusy(true);
     try {
       if (isBroadcasting) {
         await onStopBroadcast();
       } else {
+        const targetMode: StreamMode =
+          studioMode === 'video'
+            ? 'video-24-7'
+            : streamConfig.mode === 'canvas-relay'
+              ? 'canvas-relay'
+              : 'autonomous-24-7';
         await onStartBroadcast({
           streamKey: streamKeyInput,
           rtmpUrl: rtmpUrlInput,
-          mode: streamConfig.mode,
+          mode: targetMode,
+          videoEncodeMode: encodeMode,
           dryRun: streamConfig.dryRun,
         });
       }
@@ -99,40 +111,52 @@ export function BroadcastPanel({
             ? 'Stream Error'
             : 'Standby';
 
+  const showBroadcastBody = studioMode === 'video' || activeTab === 'broadcast';
+
   return (
     <aside
       aria-label="Broadcast and Audio Studio Controls"
       className="flex flex-col rounded-2xl border border-zinc-800/80 bg-[#101218] p-5"
     >
-      {/* Segmented Control Tabs */}
-      <div className="flex items-center gap-1 rounded-xl bg-zinc-950/80 p-1 border border-zinc-800/80">
-        <button
-          type="button"
-          onClick={() => onTabChange('broadcast')}
-          className={`flex-1 inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
-            activeTab === 'broadcast'
-              ? 'bg-zinc-800 text-white'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          <Radio className="h-3.5 w-3.5" />
-          <span>YouTube Live</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => onTabChange('fx')}
-          className={`flex-1 inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
-            activeTab === 'fx'
-              ? 'bg-zinc-800 text-white'
-              : 'text-zinc-400 hover:text-zinc-200'
-          }`}
-        >
-          <Sliders className="h-3.5 w-3.5" />
-          <span>Phonk FX & Glass</span>
-        </button>
-      </div>
+      {/* Header / Mode Tabs */}
+      {studioMode === 'video' ? (
+        <div className="flex items-center justify-between gap-2 border-b border-zinc-800/80 pb-3.5">
+          <div className="flex items-center gap-2 text-sm font-semibold text-white">
+            <Radio className="h-4 w-4 text-red-400" />
+            <span>YouTube Direct Video Live</span>
+          </div>
+          <span className="font-mono-tabular text-[11px] text-zinc-400">24/7 Server Stream</span>
+        </div>
+      ) : (
+        <div className="flex items-center gap-1 rounded-xl border border-zinc-800/80 bg-zinc-950/80 p-1">
+          <button
+            type="button"
+            onClick={() => onTabChange('broadcast')}
+            className={`flex-1 inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              activeTab === 'broadcast'
+                ? 'bg-zinc-800 text-white'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Radio className="h-3.5 w-3.5" />
+            <span>YouTube Live</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onTabChange('fx')}
+            className={`flex-1 inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+              activeTab === 'fx'
+                ? 'bg-zinc-800 text-white'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Sliders className="h-3.5 w-3.5" />
+            <span>Phonk FX & Glass</span>
+          </button>
+        </div>
+      )}
 
-      {activeTab === 'broadcast' ? (
+      {showBroadcastBody ? (
         <div className="mt-5 space-y-4">
           {/* Status Summary Row */}
           <div className="flex items-center justify-between rounded-xl border border-zinc-800 bg-zinc-950/60 px-4 py-3">
@@ -270,83 +294,127 @@ export function BroadcastPanel({
             />
           </div>
 
-          {/* Broadcast Engine Selector */}
-          <div>
-            <span className="block text-xs font-medium text-zinc-300">Broadcast Engine Mode</span>
-            <div className="mt-1.5 grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                disabled={isBroadcasting}
-                onClick={() => void onUpdateConfig({ mode: 'autonomous-24-7' })}
-                className={`rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60 ${
-                  streamConfig.mode === 'autonomous-24-7'
-                    ? 'border-white/35 bg-white/10 text-white'
-                    : 'border-zinc-800 bg-zinc-950/60 text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                <p className="text-xs font-semibold">24/7 Server Loop</p>
-                <p className="mt-0.5 text-[11px] text-zinc-400">
-                  Runs lifetime even if tab closes
-                </p>
-              </button>
-              <button
-                type="button"
-                disabled={isBroadcasting}
-                onClick={() => void onUpdateConfig({ mode: 'canvas-relay' })}
-                className={`rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60 ${
-                  streamConfig.mode === 'canvas-relay'
-                    ? 'border-white/35 bg-white/10 text-white'
-                    : 'border-zinc-800 bg-zinc-950/60 text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                <p className="text-xs font-semibold">Live Canvas Relay</p>
-                <p className="mt-0.5 text-[11px] text-zinc-400">
-                  Streams browser FX & bass pulse
-                </p>
-              </button>
-            </div>
-          </div>
-
-          {/* Resolution & Bitrate */}
-          <div className="grid grid-cols-2 gap-3">
+          {/* Engine / Video Encoding Selector */}
+          {studioMode === 'video' ? (
             <div>
-              <label htmlFor="stream-res" className="block text-xs font-medium text-zinc-300">
-                Resolution
-              </label>
-              <select
-                id="stream-res"
-                value={streamConfig.resolution}
-                disabled={isBroadcasting}
-                onChange={(e) =>
-                  void onUpdateConfig({
-                    resolution: e.target.value as '1280x720' | '1920x1080',
-                  })
-                }
-                className="mt-1.5 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-white focus:border-zinc-500 focus:outline-none disabled:opacity-60"
-              >
-                <option value="1280x720">720p HD (1280x720)</option>
-                <option value="1920x1080">1080p Full HD (1920x1080)</option>
-              </select>
+              <span className="block text-xs font-medium text-zinc-300">Video Stream Encoding</span>
+              <div className="mt-1.5 grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  disabled={isBroadcasting}
+                  onClick={() => void onUpdateConfig({ videoEncodeMode: 'safe-encode' })}
+                  className={`rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60 ${
+                    encodeMode === 'safe-encode'
+                      ? 'border-white/35 bg-white/10 text-white'
+                      : 'border-zinc-800 bg-zinc-950/60 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <p className="text-xs font-semibold">Auto Safe Encode</p>
+                  <p className="mt-0.5 text-[11px] text-zinc-400">
+                    Works with any MP4, MKV, MOV
+                  </p>
+                </button>
+                <button
+                  type="button"
+                  disabled={isBroadcasting}
+                  onClick={() => void onUpdateConfig({ videoEncodeMode: 'direct-copy' })}
+                  className={`rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60 ${
+                    encodeMode === 'direct-copy'
+                      ? 'border-white/35 bg-white/10 text-white'
+                      : 'border-zinc-800 bg-zinc-950/60 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <p className="text-xs font-semibold">Direct Copy (Zero CPU)</p>
+                  <p className="mt-0.5 text-[11px] text-zinc-400">
+                    Original quality H.264 pass-through
+                  </p>
+                </button>
+              </div>
             </div>
-
+          ) : (
             <div>
-              <label htmlFor="stream-fps" className="block text-xs font-medium text-zinc-300">
-                Frame Rate
-              </label>
-              <select
-                id="stream-fps"
-                value={streamConfig.fps}
-                disabled={isBroadcasting}
-                onChange={(e) =>
-                  void onUpdateConfig({ fps: Number(e.target.value) as 30 | 60 })
-                }
-                className="mt-1.5 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-white focus:border-zinc-500 focus:outline-none disabled:opacity-60"
-              >
-                <option value={30}>30 FPS (Stable)</option>
-                <option value={60}>60 FPS (Smooth)</option>
-              </select>
+              <span className="block text-xs font-medium text-zinc-300">Broadcast Engine Mode</span>
+              <div className="mt-1.5 grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  disabled={isBroadcasting}
+                  onClick={() => void onUpdateConfig({ mode: 'autonomous-24-7' })}
+                  className={`rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60 ${
+                    streamConfig.mode === 'autonomous-24-7'
+                      ? 'border-white/35 bg-white/10 text-white'
+                      : 'border-zinc-800 bg-zinc-950/60 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <p className="text-xs font-semibold">24/7 Server Loop</p>
+                  <p className="mt-0.5 text-[11px] text-zinc-400">
+                    Runs lifetime even if tab closes
+                  </p>
+                </button>
+                <button
+                  type="button"
+                  disabled={isBroadcasting}
+                  onClick={() => void onUpdateConfig({ mode: 'canvas-relay' })}
+                  className={`rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60 ${
+                    streamConfig.mode === 'canvas-relay'
+                      ? 'border-white/35 bg-white/10 text-white'
+                      : 'border-zinc-800 bg-zinc-950/60 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <p className="text-xs font-semibold">Live Canvas Relay</p>
+                  <p className="mt-0.5 text-[11px] text-zinc-400">
+                    Streams browser FX & bass pulse
+                  </p>
+                </button>
+              </div>
             </div>
-          </div>
+          )}
+
+          {/* Resolution & Frame Rate */}
+          {(studioMode === 'phonk' || encodeMode === 'safe-encode') ? (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="stream-res" className="block text-xs font-medium text-zinc-300">
+                  Resolution
+                </label>
+                <select
+                  id="stream-res"
+                  value={streamConfig.resolution}
+                  disabled={isBroadcasting}
+                  onChange={(e) =>
+                    void onUpdateConfig({
+                      resolution: e.target.value as '1280x720' | '1920x1080',
+                    })
+                  }
+                  className="mt-1.5 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-white focus:border-zinc-500 focus:outline-none disabled:opacity-60"
+                >
+                  <option value="1280x720">720p HD (1280x720)</option>
+                  <option value="1920x1080">1080p Full HD (1920x1080)</option>
+                </select>
+              </div>
+
+              <div>
+                <label htmlFor="stream-fps" className="block text-xs font-medium text-zinc-300">
+                  Frame Rate
+                </label>
+                <select
+                  id="stream-fps"
+                  value={streamConfig.fps}
+                  disabled={isBroadcasting}
+                  onChange={(e) =>
+                    void onUpdateConfig({ fps: Number(e.target.value) as 30 | 60 })
+                  }
+                  className="mt-1.5 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-xs text-white focus:border-zinc-500 focus:outline-none disabled:opacity-60"
+                >
+                  <option value={30}>30 FPS (Stable)</option>
+                  <option value={60}>60 FPS (Smooth)</option>
+                </select>
+              </div>
+            </div>
+          ) : (
+            <div className="rounded-lg border border-zinc-800/80 bg-zinc-950/50 px-3.5 py-2.5 text-[11px] text-zinc-400">
+              Direct Copy streams each uploaded H.264 video at its native resolution and frame rate with near-zero CPU usage.
+            </div>
+          )}
 
           {/* Toggles: Auto-Reconnect & Local Test Mode */}
           <div className="space-y-2.5 pt-1">

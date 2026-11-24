@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import {
   buildPaletteFromRGB,
   computeProgressPercent,
+  formatFileSize,
   formatTimeMMSS,
   formatUptimeHHMMSS,
   getNextLoopIndex,
   getPreviousLoopIndex,
+  isDirectCopyCompatibleVideo,
   maskStreamKey,
   reorderTracks,
   validateRtmpTarget,
@@ -19,6 +21,28 @@ test('formatTimeMMSS formats minutes, seconds, hours, and edge values', () => {
   assert.equal(formatTimeMMSS(9), '00:09');
   assert.equal(formatTimeMMSS(125), '02:05');
   assert.equal(formatTimeMMSS(3661), '01:01:01');
+});
+
+test('formatFileSize formats MB and GB cleanly', () => {
+  assert.equal(formatFileSize(0), '0 MB');
+  assert.equal(formatFileSize(5.5 * 1024 * 1024), '5.5 MB');
+  assert.equal(formatFileSize(250 * 1024 * 1024), '250 MB');
+  assert.equal(formatFileSize(1.5 * 1024 * 1024 * 1024), '1.50 GB');
+});
+
+test('isDirectCopyCompatibleVideo detects H.264 + AAC streams accurately', () => {
+  assert.equal(
+    isDirectCopyCompatibleVideo({ videoCodec: 'h264', audioCodec: 'aac', hasAudio: true }),
+    true
+  );
+  assert.equal(
+    isDirectCopyCompatibleVideo({ videoCodec: 'vp9', audioCodec: 'opus', hasAudio: true }),
+    false
+  );
+  assert.equal(
+    isDirectCopyCompatibleVideo({ videoCodec: 'h264', audioCodec: '', hasAudio: false }),
+    false
+  );
 });
 
 test('formatUptimeHHMMSS formats broadcast duration cleanly', () => {

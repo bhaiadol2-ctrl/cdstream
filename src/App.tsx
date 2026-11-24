@@ -1,24 +1,30 @@
-import { Plus } from 'lucide-react';
+import { Film, Music2, Plus } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AddPhonkModal } from './components/AddPhonkModal';
+import { AddVideoModal } from './components/AddVideoModal';
 import { BroadcastPanel } from './components/BroadcastPanel';
 import { LiveGlassScreen } from './components/LiveGlassScreen';
 import { PlaylistQueue } from './components/PlaylistQueue';
+import { VideoLiveStage } from './components/VideoLiveStage';
+import { VideoQueue } from './components/VideoQueue';
 import { usePhonkPlayer } from './hooks/usePhonkPlayer';
 import {
   DEFAULT_YOUTUBE_RTMPS_URL,
+  getNextLoopIndex,
+  getPreviousLoopIndex,
   reorderTracks,
   type AudioFxSettings,
   type PhonkTrack,
   type StreamConfig,
   type StreamMode,
   type StreamStatus,
+  type VideoItem,
   type VisualSettings,
 } from './lib/phonkLogic';
 
 const INITIAL_STATUS: StreamStatus = {
   state: 'idle',
-  mode: 'autonomous-24-7',
+  mode: 'video-24-7',
   dryRun: false,
   hasStreamKey: false,
   maskedStreamKey: '',
@@ -42,17 +48,25 @@ const INITIAL_CONFIG: StreamConfig = {
   videoBitrateKbps: 4500,
   audioBitrateKbps: 192,
   autoReconnect: true,
-  mode: 'autonomous-24-7',
+  mode: 'video-24-7',
+  videoEncodeMode: 'safe-encode',
   dryRun: false,
 };
 
 export default function App() {
+  const [studioMode, setStudioMode] = useState<'video' | 'phonk'>('video');
   const [tracks, setTracks] = useState<PhonkTrack[]>([]);
-  const [loadingTracks, setLoadingTracks] = useState(true);
+  const [videos, setVideos] = useState<VideoItem[]>([]);
+  const [loadingMedia, setLoadingMedia] = useState(true);
+  const [currentVideoIndex, setCurrentVideoIndex] = useState(0);
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
+  const [videoShuffle, setVideoShuffle] = useState(false);
+
   const [streamStatus, setStreamStatus] = useState<StreamStatus>(INITIAL_STATUS);
   const [streamConfig, setStreamConfig] = useState<StreamConfig>(INITIAL_CONFIG);
   const [streamActionError, setStreamActionError] = useState<string | null>(null);
-  const [addModalOpen, setAddModalOpen] = useState(false);
+  const [addPhonkModalOpen, setAddPhonkModalOpen] = useState(false);
+  const [addVideoModalOpen, setAddVideoModalOpen] = useState(false);
   const [panelTab, setPanelTab] = useState<'broadcast' | 'fx'>('broadcast');
 
   const [fx, setFx] = useState<AudioFxSettings>({
@@ -83,13 +97,14 @@ export default function App() {
     broadcastCanvasRef.current = canvas;
   }, []);
 
-  // Load initial tracks and stream status
+  // Load initial tracks, videos, and stream status
   useEffect(() => {
     let active = true;
     const loadInitial = async () => {
       try {
-        const [tracksRes, streamRes] = await Promise.all([
+        const [tracksRes, videosRes, streamRes] = await Promise.all([
           fetch('/api/tracks'),
+          fetch('/api/videos'),
           fetch('/api/stream/status'),
         ]);
         if (!active) return;
@@ -97,15 +112,30 @@ export default function App() {
           const data = await tracksRes.json();
           if (Array.isArray(data.tracks)) setTracks(data.tracks);
         }
+        if (videosRes.ok) {
+          const vData = await videosRes.json();
+          if (Array.isArray(vData.videos)) setVideos(vData.videos);
+        }
         if (streamRes.ok) {
           const sData = await streamRes.json();
           if (sData.status) setStreamStatus(sData.status);
-          if (sData.config) setStreamConfig(sData.config);
+          if (sData.config) {
+            setStreamConfig(sData.config);
+            if (
+              sData.status &&
+              sData.status.state !== 'idle' &&
+              sData.status.state !== 'error'
+            ) {
+              setStudioMode(sData.status.mode === 'video-24-7' ? 'video' : 'phonk');
+            } else {
+              setStudioMode(sData.config.mode === 'video-24-7' ? 'video' : 'phonk');
+            }
+          }
         }
       } catch {
         // ignore startup network error
       } finally {
-        if (active) setLoadingTracks(false);
+        if (active) setLoadingMedia(false);
       }
     };
     void loadInitial();
@@ -219,6 +249,11 @@ export default function App() {
     player.getRelayAudioStream,
   ]);
 
+  const isBroadcasting =
+    streamStatus.state === 'live' ||
+    streamStatus.state === 'connecting' ||
+    streamStatus.state === 'reconnecting';
+
   const handleUpdateConfig = async (patch: Partial<StreamConfig> & { streamKey?: string }) => {
     setStreamActionError(null);
     setStreamConfig((prev) => ({ ...prev, ...patch }));
@@ -238,10 +273,28 @@ export default function App() {
     }
   };
 
+  const handleSwitchStudioMode = (nextMode: 'video' | 'phonk') => {
+    if (isBroadcasting || nextMode === studioMode) return;
+    setStudioMode(nextMode);
+    if (nextMode === 'video') {
+      setPanelTab('broadcast');
+      if (player.isPlaying) {
+        void player.togglePlay();
+      }
+      void handleUpdateConfig({ mode: 'video-24-7' });
+    } else {
+      setIsVideoPlaying(false);
+      void handleUpdateConfig({
+        mode: streamConfig.mode === 'canvas-relay' ? 'canvas-relay' : 'autonomous-24-7',
+      });
+    }
+  };
+
   const handleStartBroadcast = async (payload: {
     streamKey: string;
     rtmpUrl: string;
     mode: StreamMode;
+    videoEncodeMode?: 'safe-encode' | 'direct-copy';
     dryRun: boolean;
   }) => {
     setStreamActionError(null);
@@ -249,10 +302,10 @@ export default function App() {
       ...prev,
       rtmpUrl: payload.rtmpUrl,
       mode: payload.mode,
+      ...(payload.videoEncodeMode ? { videoEncodeMode: payload.videoEncodeMode } : {}),
       dryRun: payload.dryRun,
     }));
     try {
-      // Ensure audio preview plays in Canvas Relay mode
       if (payload.mode === 'canvas-relay' && !player.isPlaying && tracks.length > 0) {
         await player.togglePlay();
       }
@@ -289,6 +342,7 @@ export default function App() {
     }
   };
 
+  // Phonk track actions
   const handleMoveTrack = async (fromIndex: number, toIndex: number) => {
     const nextList = reorderTracks(tracks, fromIndex, toIndex);
     setTracks(nextList);
@@ -329,11 +383,82 @@ export default function App() {
     }
   };
 
+  // Direct Video actions
+  const safeVideoIndex = videos.length > 0 ? Math.min(currentVideoIndex, videos.length - 1) : 0;
+  const currentVideo = videos.length > 0 ? videos[safeVideoIndex] : null;
+  const nextVideoIdx = getNextLoopIndex(safeVideoIndex, videos.length, videoShuffle);
+  const nextVideo =
+    videos.length > 1 && nextVideoIdx >= 0 && nextVideoIdx < videos.length
+      ? videos[nextVideoIdx]
+      : null;
+
+  const handleNextVideo = useCallback(() => {
+    setCurrentVideoIndex((idx) => {
+      const next = getNextLoopIndex(idx, videos.length, videoShuffle);
+      return next < 0 ? 0 : next;
+    });
+  }, [videos.length, videoShuffle]);
+
+  const handlePrevVideo = useCallback(() => {
+    setCurrentVideoIndex((idx) => {
+      const prev = getPreviousLoopIndex(idx, videos.length);
+      return prev < 0 ? 0 : prev;
+    });
+  }, [videos.length]);
+
+  const handleSelectVideo = useCallback((idx: number) => {
+    setCurrentVideoIndex(idx);
+    setIsVideoPlaying(true);
+  }, []);
+
+  const handleMoveVideo = async (fromIndex: number, toIndex: number) => {
+    const nextList = reorderTracks(videos, fromIndex, toIndex);
+    setVideos(nextList);
+    if (safeVideoIndex === fromIndex) {
+      setCurrentVideoIndex(toIndex);
+    }
+    await fetch('/api/videos/reorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderedIds: nextList.map((v) => v.id) }),
+    }).catch(() => undefined);
+  };
+
+  const handleRemoveVideo = async (id: string) => {
+    const res = await fetch(`/api/videos/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data.videos)) {
+        setVideos(data.videos);
+        if (currentVideoIndex >= data.videos.length) {
+          setCurrentVideoIndex(Math.max(0, data.videos.length - 1));
+        }
+        if (data.videos.length === 0) {
+          setIsVideoPlaying(false);
+        }
+      }
+    }
+  };
+
+  const handleRenameVideo = async (id: string, title: string) => {
+    const res = await fetch(`/api/videos/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.video) {
+        setVideos((prev) => prev.map((v) => (v.id === id ? data.video : v)));
+      }
+    }
+  };
+
   return (
     <div className="min-h-screen bg-[#08090d] text-zinc-100">
       {/* Strict 3-Zone Top Bar Contract */}
       <header className="border-b border-zinc-800/80 bg-[#0b0c12]/90 backdrop-blur-md">
-        <div className="mx-auto flex max-w-[1440px] items-center justify-between gap-8 px-4 py-3.5 sm:px-6">
+        <div className="mx-auto flex max-w-[1440px] items-center justify-between gap-6 px-4 py-3.5 sm:px-6">
           <a
             href="#live-stage"
             className="font-display text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0"
@@ -342,20 +467,38 @@ export default function App() {
           </a>
 
           <nav
-            aria-label="Studio sections"
+            aria-label="Studio mode and sections"
             className="hidden md:flex items-center gap-6 text-sm font-medium text-zinc-400"
           >
-            <a
-              href="#live-stage"
-              className="transition-colors hover:text-white whitespace-nowrap shrink-0"
+            <button
+              type="button"
+              disabled={isBroadcasting}
+              onClick={() => handleSwitchStudioMode('video')}
+              aria-pressed={studioMode === 'video'}
+              className={`inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 disabled:opacity-60 ${
+                studioMode === 'video' ? 'text-white font-semibold' : 'hover:text-white'
+              }`}
             >
-              Live Screen
-            </a>
+              <Film className="h-3.5 w-3.5" />
+              <span>Direct Video Live</span>
+            </button>
+            <button
+              type="button"
+              disabled={isBroadcasting}
+              onClick={() => handleSwitchStudioMode('phonk')}
+              aria-pressed={studioMode === 'phonk'}
+              className={`inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 disabled:opacity-60 ${
+                studioMode === 'phonk' ? 'text-white font-semibold' : 'hover:text-white'
+              }`}
+            >
+              <Music2 className="h-3.5 w-3.5" />
+              <span>Phonk Music + Cover</span>
+            </button>
             <a
               href="#loop-queue"
               className="transition-colors hover:text-white whitespace-nowrap shrink-0"
             >
-              Loop Playlist
+              Loop Queue
             </a>
             <button
               type="button"
@@ -364,23 +507,23 @@ export default function App() {
             >
               YouTube RTMP
             </button>
-            <button
-              type="button"
-              onClick={() => setPanelTab('fx')}
-              className="transition-colors hover:text-white whitespace-nowrap shrink-0"
-            >
-              Audio FX & Glass
-            </button>
           </nav>
 
           <div className="flex items-center shrink-0">
             <button
               type="button"
-              onClick={() => setAddModalOpen(true)}
+              data-testid="primary-upload-cta"
+              onClick={() => {
+                if (studioMode === 'video') {
+                  setAddVideoModalOpen(true);
+                } else {
+                  setAddPhonkModalOpen(true);
+                }
+              }}
               className="inline-flex items-center gap-1.5 rounded-lg bg-white px-4 py-2 text-xs font-semibold text-zinc-950 transition-colors hover:bg-zinc-200 whitespace-nowrap shrink-0"
             >
               <Plus className="h-3.5 w-3.5" />
-              <span>Add Phonk</span>
+              <span>{studioMode === 'video' ? 'Upload Video' : 'Add Phonk'}</span>
             </button>
           </div>
         </div>
@@ -388,31 +531,74 @@ export default function App() {
 
       {/* Main Broadcast Studio Workspace */}
       <main className="mx-auto max-w-[1440px] px-4 py-6 sm:px-6">
+        {/* Compact Mode Switcher for mobile viewports */}
+        <div className="mb-4 flex items-center gap-1.5 rounded-xl border border-zinc-800/80 bg-[#101218] p-1 md:hidden">
+          <button
+            type="button"
+            disabled={isBroadcasting}
+            onClick={() => handleSwitchStudioMode('video')}
+            aria-pressed={studioMode === 'video'}
+            className={`flex-1 inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition-colors disabled:opacity-60 ${
+              studioMode === 'video' ? 'bg-zinc-800 text-white' : 'text-zinc-400'
+            }`}
+          >
+            <Film className="h-3.5 w-3.5" />
+            <span>Direct Video Live</span>
+          </button>
+          <button
+            type="button"
+            disabled={isBroadcasting}
+            onClick={() => handleSwitchStudioMode('phonk')}
+            aria-pressed={studioMode === 'phonk'}
+            className={`flex-1 inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition-colors disabled:opacity-60 ${
+              studioMode === 'phonk' ? 'bg-zinc-800 text-white' : 'text-zinc-400'
+            }`}
+          >
+            <Music2 className="h-3.5 w-3.5" />
+            <span>Phonk Music + Cover</span>
+          </button>
+        </div>
+
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 lg:items-start">
-          {/* Primary Column: 16:9 Glassmorphic Live Screen + Sequential Loop Queue */}
+          {/* Primary Column: 16:9 Live Screen + Sequential Loop Queue */}
           <div className="space-y-6 lg:col-span-8">
             <div id="live-stage">
-              <LiveGlassScreen
-                currentTrack={player.currentTrack}
-                nextTrack={player.nextTrack}
-                trackIndex={player.currentIndex}
-                totalTracks={tracks.length}
-                isPlaying={player.isPlaying}
-                elapsedSec={player.elapsedSec}
-                durationSec={player.durationSec}
-                bassEnergy={player.bassEnergy}
-                streamStatus={streamStatus}
-                visuals={visuals}
-                getFrequencyData={player.getFrequencyData}
-                onTogglePlay={() => void player.togglePlay()}
-                onNext={player.next}
-                onPrevious={player.previous}
-                onSeek={player.seekTo}
-                onCanvasReady={handleCanvasReady}
-              />
+              {studioMode === 'video' ? (
+                <VideoLiveStage
+                  currentVideo={currentVideo}
+                  nextVideo={nextVideo}
+                  videoIndex={safeVideoIndex}
+                  totalVideos={videos.length}
+                  isPlaying={isVideoPlaying}
+                  streamStatus={streamStatus}
+                  onTogglePlay={setIsVideoPlaying}
+                  onNext={handleNextVideo}
+                  onPrevious={handlePrevVideo}
+                  onOpenAddModal={() => setAddVideoModalOpen(true)}
+                />
+              ) : (
+                <LiveGlassScreen
+                  currentTrack={player.currentTrack}
+                  nextTrack={player.nextTrack}
+                  trackIndex={player.currentIndex}
+                  totalTracks={tracks.length}
+                  isPlaying={player.isPlaying}
+                  elapsedSec={player.elapsedSec}
+                  durationSec={player.durationSec}
+                  bassEnergy={player.bassEnergy}
+                  streamStatus={streamStatus}
+                  visuals={visuals}
+                  getFrequencyData={player.getFrequencyData}
+                  onTogglePlay={() => void player.togglePlay()}
+                  onNext={player.next}
+                  onPrevious={player.previous}
+                  onSeek={player.seekTo}
+                  onCanvasReady={handleCanvasReady}
+                />
+              )}
             </div>
 
-            {player.audioError && (
+            {studioMode === 'phonk' && player.audioError && (
               <div
                 role="alert"
                 className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200"
@@ -422,12 +608,25 @@ export default function App() {
             )}
 
             <div id="loop-queue">
-              {loadingTracks ? (
-                <div className="rounded-2xl border border-zinc-800/80 bg-[#101218] p-5 space-y-3">
+              {loadingMedia ? (
+                <div className="space-y-3 rounded-2xl border border-zinc-800/80 bg-[#101218] p-5">
                   <div className="h-5 w-44 rounded bg-zinc-800 animate-pulse" />
                   <div className="h-14 w-full rounded-lg bg-zinc-900 animate-pulse" />
                   <div className="h-14 w-full rounded-lg bg-zinc-900 animate-pulse" />
                 </div>
+              ) : studioMode === 'video' ? (
+                <VideoQueue
+                  videos={videos}
+                  currentIndex={safeVideoIndex}
+                  isPlaying={isVideoPlaying}
+                  shuffle={videoShuffle}
+                  onToggleShuffle={() => setVideoShuffle((s) => !s)}
+                  onSelectVideo={handleSelectVideo}
+                  onMoveVideo={(from, to) => void handleMoveVideo(from, to)}
+                  onRemoveVideo={(id) => void handleRemoveVideo(id)}
+                  onRenameVideo={handleRenameVideo}
+                  onOpenAddModal={() => setAddVideoModalOpen(true)}
+                />
               ) : (
                 <PlaylistQueue
                   tracks={tracks}
@@ -439,7 +638,7 @@ export default function App() {
                   onMoveTrack={(from, to) => void handleMoveTrack(from, to)}
                   onRemoveTrack={(id) => void handleRemoveTrack(id)}
                   onRenameTrack={handleRenameTrack}
-                  onOpenAddModal={() => setAddModalOpen(true)}
+                  onOpenAddModal={() => setAddPhonkModalOpen(true)}
                   onRestoreDemos={() => void handleRestoreDemos()}
                 />
               )}
@@ -449,6 +648,7 @@ export default function App() {
           {/* Control Column: YouTube Direct Stream Key + 24/7 Engine + Phonk Audio FX */}
           <div className="lg:col-span-4 lg:sticky lg:top-6">
             <BroadcastPanel
+              studioMode={studioMode}
               streamStatus={streamStatus}
               streamConfig={streamConfig}
               fx={fx}
@@ -469,9 +669,17 @@ export default function App() {
         </div>
       </main>
 
+      <AddVideoModal
+        open={addVideoModalOpen}
+        onClose={() => setAddVideoModalOpen(false)}
+        onVideoAdded={(video) => {
+          setVideos((prev) => [...prev, video]);
+        }}
+      />
+
       <AddPhonkModal
-        open={addModalOpen}
-        onClose={() => setAddModalOpen(false)}
+        open={addPhonkModalOpen}
+        onClose={() => setAddPhonkModalOpen(false)}
         onTrackAdded={(track) => {
           setTracks((prev) => [...prev, track]);
         }}

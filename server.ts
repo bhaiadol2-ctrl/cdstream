@@ -13,7 +13,14 @@ import {
   sanitizePaletteInput,
   TrackStore,
 } from './server/trackStore.ts';
-import { type PhonkTrack, type StreamConfig } from './src/lib/phonkLogic.ts';
+import {
+  VIDEO_THUMBS_DIR,
+  VIDEOS_DIR,
+  extractVideoThumbnail,
+  probeVideoMetadata,
+  VideoStore,
+} from './server/videoStore.ts';
+import { type PhonkTrack, type StreamConfig, type VideoItem } from './src/lib/phonkLogic.ts';
 
 dotenv.config();
 
@@ -22,6 +29,7 @@ const IS_PROD = process.env.NODE_ENV === 'production';
 
 const ALLOWED_AUDIO_EXT = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac']);
 const ALLOWED_IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+const ALLOWED_VIDEO_EXT = new Set(['.mp4', '.mkv', '.mov', '.webm', '.m4v', '.ts', '.avi', '.flv']);
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
@@ -70,11 +78,40 @@ const upload = multer({
   },
 });
 
+const videoStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    fs.mkdirSync(VIDEOS_DIR, { recursive: true });
+    cb(null, VIDEOS_DIR);
+  },
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const safeExt = ALLOWED_VIDEO_EXT.has(ext) ? ext : '.mp4';
+    cb(null, `${crypto.randomUUID()}${safeExt}`);
+  },
+});
+
+const videoUpload = multer({
+  storage: videoStorage,
+  limits: {
+    fileSize: 2 * 1024 * 1024 * 1024, // 2 GB max per big video
+    files: 1,
+  },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (file.mimetype.startsWith('video/') || ALLOWED_VIDEO_EXT.has(ext)) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error('Unsupported video format. Please upload MP4, MKV, MOV, WEBM, or TS.'));
+  },
+});
+
 async function bootstrap() {
   const app = express();
   const httpServer = http.createServer(app);
   const store = new TrackStore();
-  const engine = new StreamEngine(store);
+  const videoStore = new VideoStore();
+  const engine = new StreamEngine(store, videoStore);
 
   app.use(express.json({ limit: '2mb' }));
   app.use('/uploads', express.static(UPLOADS_DIR, { fallthrough: true }));
@@ -256,6 +293,99 @@ async function bootstrap() {
     res.json({ ok: true, tracks: store.getAll() });
   });
 
+  // --- Direct Big Video Routes ---
+
+  app.get('/api/videos', (_req, res) => {
+    res.json({ videos: videoStore.getAll() });
+  });
+
+  app.post(
+    '/api/videos',
+    (req, res, next) => {
+      req.setTimeout(0);
+      res.setTimeout(0);
+      next();
+    },
+    videoUpload.single('video'),
+    async (req, res) => {
+      const videoFile = req.file;
+      if (!videoFile) {
+        res.status(400).json({ error: 'A video file is required.' });
+        return;
+      }
+
+      const rawTitle =
+        typeof req.body?.title === 'string' && req.body.title.trim()
+          ? req.body.title.trim()
+          : path.basename(videoFile.originalname || 'Live Video', path.extname(videoFile.originalname || ''));
+
+      const meta = await probeVideoMetadata(videoFile.path);
+      const thumbFilename = `${path.basename(videoFile.filename, path.extname(videoFile.filename))}.jpg`;
+      const thumbPath = path.join(VIDEO_THUMBS_DIR, thumbFilename);
+      const thumbOk = await extractVideoThumbnail(videoFile.path, thumbPath, meta.durationSec);
+
+      const clientDuration = Number(req.body?.durationSec);
+      const durationSec =
+        meta.durationSec > 0
+          ? meta.durationSec
+          : Number.isFinite(clientDuration) && clientDuration > 0
+            ? Math.round(clientDuration)
+            : 60;
+
+      const newVideo: VideoItem = {
+        id: `vid-${crypto.randomUUID().slice(0, 8)}`,
+        title: rawTitle.slice(0, 90),
+        videoUrl: `/uploads/videos/${path.basename(videoFile.path)}`,
+        thumbnailUrl: thumbOk
+          ? `/uploads/videos/thumbs/${thumbFilename}`
+          : '/src/assets/images/phonk_cover_crimson_1795444574683.jpg',
+        durationSec,
+        width: meta.width,
+        height: meta.height,
+        fileSizeBytes: videoFile.size || 0,
+        videoCodec: meta.videoCodec,
+        audioCodec: meta.audioCodec,
+        hasAudio: meta.hasAudio,
+        createdAt: Date.now(),
+      };
+
+      const saved = videoStore.add(newVideo);
+      res.status(201).json({ video: saved });
+    }
+  );
+
+  app.patch('/api/videos/:id', (req, res) => {
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+    if (!title) {
+      res.status(400).json({ error: 'Video title is required.' });
+      return;
+    }
+    const updated = videoStore.update(req.params.id, { title: title.slice(0, 90) });
+    if (!updated) {
+      res.status(404).json({ error: 'Video not found.' });
+      return;
+    }
+    res.json({ video: updated });
+  });
+
+  app.post('/api/videos/reorder', (req, res) => {
+    const orderedIds = req.body?.orderedIds;
+    if (!Array.isArray(orderedIds) || !orderedIds.every((id) => typeof id === 'string')) {
+      res.status(400).json({ error: 'orderedIds must be an array of strings.' });
+      return;
+    }
+    res.json({ videos: videoStore.reorder(orderedIds) });
+  });
+
+  app.delete('/api/videos/:id', (req, res) => {
+    const removed = videoStore.remove(req.params.id);
+    if (!removed) {
+      res.status(404).json({ error: 'Video not found.' });
+      return;
+    }
+    res.json({ ok: true, videos: videoStore.getAll() });
+  });
+
   // --- YouTube Live Stream Control Routes ---
 
   app.get('/api/stream/status', (_req, res) => {
@@ -283,7 +413,12 @@ async function bootstrap() {
     if (typeof body.videoBitrateKbps === 'number') patch.videoBitrateKbps = body.videoBitrateKbps;
     if (typeof body.audioBitrateKbps === 'number') patch.audioBitrateKbps = body.audioBitrateKbps;
     if (typeof body.autoReconnect === 'boolean') patch.autoReconnect = body.autoReconnect;
-    if (body.mode === 'autonomous-24-7' || body.mode === 'canvas-relay') patch.mode = body.mode;
+    if (body.mode === 'video-24-7' || body.mode === 'autonomous-24-7' || body.mode === 'canvas-relay') {
+      patch.mode = body.mode;
+    }
+    if (body.videoEncodeMode === 'safe-encode' || body.videoEncodeMode === 'direct-copy') {
+      patch.videoEncodeMode = body.videoEncodeMode;
+    }
     if (typeof body.dryRun === 'boolean') patch.dryRun = body.dryRun;
     if (body.visuals && typeof body.visuals === 'object') patch.visuals = body.visuals;
 
@@ -300,13 +435,17 @@ async function bootstrap() {
       typeof body.rtmpUrl === 'string' ||
       typeof body.dryRun === 'boolean' ||
       body.mode ||
+      body.videoEncodeMode ||
       body.visuals
     ) {
       engine.updateConfig({
         ...(typeof body.rtmpUrl === 'string' ? { rtmpUrl: body.rtmpUrl } : {}),
         ...(typeof body.dryRun === 'boolean' ? { dryRun: body.dryRun } : {}),
-        ...(body.mode === 'autonomous-24-7' || body.mode === 'canvas-relay'
+        ...(body.mode === 'video-24-7' || body.mode === 'autonomous-24-7' || body.mode === 'canvas-relay'
           ? { mode: body.mode }
+          : {}),
+        ...(body.videoEncodeMode === 'safe-encode' || body.videoEncodeMode === 'direct-copy'
+          ? { videoEncodeMode: body.videoEncodeMode }
           : {}),
         ...(body.visuals && typeof body.visuals === 'object' ? { visuals: body.visuals } : {}),
       });
