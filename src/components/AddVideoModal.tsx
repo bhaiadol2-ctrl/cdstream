@@ -1,157 +1,337 @@
-import { CheckCircle2, Film, Upload, Video, X } from 'lucide-react';
-import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { formatFileSize, formatTimeMMSS, type VideoItem } from '../lib/phonkLogic';
+import { CheckCircle2, Film, Plus, Trash2, Upload, X } from 'lucide-react';
+import { useEffect, useRef, useState, type DragEvent, type FormEvent } from 'react';
+import {
+  calculateUploadChunks,
+  formatFileSize,
+  isLikelyVideoFile,
+  UPLOAD_CHUNK_SIZE_BYTES,
+  type VideoItem,
+} from '../lib/phonkLogic';
 
 interface AddVideoModalProps {
   open: boolean;
   onClose: () => void;
-  onVideoAdded: (video: VideoItem) => void;
+  onVideosAdded: (videos: VideoItem[]) => void;
 }
 
-export function AddVideoModal({ open, onClose, onVideoAdded }: AddVideoModalProps) {
-  const [title, setTitle] = useState('');
-  const [videoFile, setVideoFile] = useState<File | null>(null);
-  const [detectedDuration, setDetectedDuration] = useState(0);
-  const [detectedDims, setDetectedDims] = useState<{ w: number; h: number } | null>(null);
+interface PendingFile {
+  id: string;
+  file: File;
+  title: string;
+  status: 'queued' | 'uploading' | 'processing' | 'done' | 'error';
+  progressPct: number;
+  uploadedBytes: number;
+  error?: string;
+}
+
+export function AddVideoModal({ open, onClose, onVideosAdded }: AddVideoModalProps) {
+  const [queue, setQueue] = useState<PendingFile[]>([]);
   const [uploading, setUploading] = useState(false);
-  const [uploadPct, setUploadPct] = useState(0);
-  const [uploadedBytes, setUploadedBytes] = useState(0);
+  const [dragOver, setDragOver] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const xhrRef = useRef<XMLHttpRequest | null>(null);
+  const activeUploadIdRef = useRef<string | null>(null);
+  const cancelledRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     return () => {
+      cancelledRef.current = true;
       if (xhrRef.current) {
         xhrRef.current.abort();
         xhrRef.current = null;
+      }
+      if (activeUploadIdRef.current) {
+        void fetch(`/api/videos/upload/${encodeURIComponent(activeUploadIdRef.current)}`, {
+          method: 'DELETE',
+        }).catch(() => undefined);
+        activeUploadIdRef.current = null;
       }
     };
   }, []);
 
   if (!open) return null;
 
-  const resetForm = () => {
-    setTitle('');
-    setVideoFile(null);
-    setDetectedDuration(0);
-    setDetectedDims(null);
+  const resetModal = () => {
+    setQueue([]);
     setUploading(false);
-    setUploadPct(0);
-    setUploadedBytes(0);
+    setDragOver(false);
     setError(null);
+    cancelledRef.current = false;
+    activeUploadIdRef.current = null;
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
   };
 
   const handleClose = () => {
+    cancelledRef.current = true;
     if (xhrRef.current) {
       xhrRef.current.abort();
       xhrRef.current = null;
     }
-    resetForm();
+    if (activeUploadIdRef.current) {
+      void fetch(`/api/videos/upload/${encodeURIComponent(activeUploadIdRef.current)}`, {
+        method: 'DELETE',
+      }).catch(() => undefined);
+      activeUploadIdRef.current = null;
+    }
+    resetModal();
     onClose();
   };
 
-  const handleVideoFileChange = (file: File | null) => {
-    setVideoFile(file);
+  const addFiles = (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
     setError(null);
-    setDetectedDuration(0);
-    setDetectedDims(null);
-
-    if (!file) return;
-
-    if (!title.trim()) {
-      const cleanName = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
-      setTitle(cleanName || 'Live Video');
+    const picked = Array.from(fileList);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
     }
 
-    const objUrl = URL.createObjectURL(file);
-    const probe = document.createElement('video');
-    probe.preload = 'metadata';
-    probe.muted = true;
-    probe.onloadedmetadata = () => {
-      if (Number.isFinite(probe.duration) && probe.duration > 0) {
-        setDetectedDuration(Math.round(probe.duration));
+    const items: PendingFile[] = [];
+    const rejectedNames: string[] = [];
+
+    for (let i = 0; i < picked.length; i += 1) {
+      const f = picked[i];
+      if (f.size <= 0) {
+        rejectedNames.push(`${f.name} (empty file)`);
+        continue;
       }
-      if (probe.videoWidth > 0 && probe.videoHeight > 0) {
-        setDetectedDims({ w: probe.videoWidth, h: probe.videoHeight });
+      if (!isLikelyVideoFile(f.name, f.type)) {
+        rejectedNames.push(`${f.name} (not a supported video)`);
+        continue;
       }
-      URL.revokeObjectURL(objUrl);
-    };
-    probe.onerror = () => {
-      URL.revokeObjectURL(objUrl);
-    };
-    probe.src = objUrl;
+      const cleanName = f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim() || 'Live Video';
+      items.push({
+        id: `${Date.now()}-${i}-${f.name}`,
+        file: f,
+        title: cleanName,
+        status: 'queued',
+        progressPct: 0,
+        uploadedBytes: 0,
+      });
+    }
+
+    if (rejectedNames.length > 0) {
+      setError(`Skipped unsupported file(s): ${rejectedNames.join(', ')}`);
+    }
+    if (items.length > 0) {
+      setQueue((prev) => [...prev, ...items]);
+    }
   };
 
-  const handleSubmit = (e: FormEvent) => {
+  const handleDrop = (e: DragEvent<HTMLLabelElement>) => {
+    e.preventDefault();
+    setDragOver(false);
+    if (!uploading) {
+      addFiles(e.dataTransfer.files);
+    }
+  };
+
+  const sendChunkOnce = (
+    uploadId: string,
+    offset: number,
+    chunkBlob: Blob,
+    onByteProgress: (loadedInChunk: number) => void
+  ): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhrRef.current = xhr;
+
+      xhr.upload.onprogress = (ev) => {
+        if (ev.lengthComputable) {
+          onByteProgress(Math.min(chunkBlob.size, ev.loaded));
+        }
+      };
+
+      xhr.onload = () => {
+        xhrRef.current = null;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve();
+          return;
+        }
+        let errMsg = `Chunk upload failed (${xhr.status})`;
+        try {
+          const parsed = JSON.parse(xhr.responseText);
+          if (parsed?.error) errMsg = parsed.error;
+        } catch {
+          // keep HTTP status fallback
+        }
+        reject(new Error(errMsg));
+      };
+
+      xhr.onerror = () => {
+        xhrRef.current = null;
+        reject(new Error('Network error while uploading video chunk.'));
+      };
+
+      xhr.onabort = () => {
+        xhrRef.current = null;
+        reject(new Error('Upload cancelled.'));
+      };
+
+      xhr.open('POST', '/api/videos/upload/chunk');
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.setRequestHeader('X-Upload-Id', uploadId);
+      xhr.setRequestHeader('X-Chunk-Offset', String(offset));
+      xhr.send(chunkBlob);
+    });
+  };
+
+  const uploadSingleFile = async (item: PendingFile): Promise<VideoItem> => {
+    const initRes = await fetch('/api/videos/upload/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: item.file.name,
+        mimeType: item.file.type,
+        fileSize: item.file.size,
+        title: item.title.trim() || 'Live Video',
+      }),
+    });
+
+    const initData = await initRes.json().catch(() => null);
+    if (!initRes.ok || !initData?.uploadId) {
+      throw new Error(initData?.error || `Could not start upload (${initRes.status})`);
+    }
+
+    const uploadId = String(initData.uploadId);
+    activeUploadIdRef.current = uploadId;
+    const chunkSize = Number(initData.chunkSize) || UPLOAD_CHUNK_SIZE_BYTES;
+    const slices = calculateUploadChunks(item.file.size, chunkSize);
+
+    try {
+      for (const slice of slices) {
+        if (cancelledRef.current) {
+          throw new Error('Upload cancelled.');
+        }
+
+        const chunkBlob = item.file.slice(slice.start, slice.end);
+        let attempt = 0;
+        const maxAttempts = 3;
+        while (attempt < maxAttempts) {
+          try {
+            await sendChunkOnce(uploadId, slice.start, chunkBlob, (loadedInChunk) => {
+              const totalUploaded = Math.min(item.file.size, slice.start + loadedInChunk);
+              const pct = Math.min(99, Math.round((totalUploaded / item.file.size) * 100));
+              setQueue((prev) =>
+                prev.map((q) =>
+                  q.id === item.id
+                    ? { ...q, uploadedBytes: totalUploaded, progressPct: pct }
+                    : q
+                )
+              );
+            });
+            break;
+          } catch (chunkErr) {
+            if (cancelledRef.current) {
+              throw chunkErr;
+            }
+            attempt += 1;
+            if (attempt >= maxAttempts) {
+              throw chunkErr;
+            }
+            await new Promise((r) => window.setTimeout(r, 600 * attempt));
+          }
+        }
+      }
+
+      setQueue((prev) =>
+        prev.map((q) =>
+          q.id === item.id
+            ? { ...q, status: 'processing', uploadedBytes: item.file.size, progressPct: 99 }
+            : q
+        )
+      );
+
+      const completeRes = await fetch('/api/videos/upload/complete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          uploadId,
+          title: item.title.trim() || 'Live Video',
+        }),
+      });
+      const completeData = await completeRes.json().catch(() => null);
+      const saved: VideoItem | undefined = completeData?.video || completeData?.videos?.[0];
+      if (!completeRes.ok || !saved) {
+        throw new Error(completeData?.error || `Failed to finalize video (${completeRes.status})`);
+      }
+      activeUploadIdRef.current = null;
+      return saved;
+    } catch (err) {
+      if (activeUploadIdRef.current === uploadId) {
+        activeUploadIdRef.current = null;
+        void fetch(`/api/videos/upload/${encodeURIComponent(uploadId)}`, {
+          method: 'DELETE',
+        }).catch(() => undefined);
+      }
+      throw err;
+    }
+  };
+
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
 
-    if (!videoFile) {
-      setError('Please choose a video file (.mp4, .mkv, .mov, .webm, or .ts).');
+    const pendingItems = queue.filter((q) => q.status === 'queued' || q.status === 'error');
+    if (pendingItems.length === 0) {
+      setError('Select at least one video or movie file (.mp4, .mkv, .mov, .webm, .3gp).');
       return;
     }
 
-    const finalTitle =
-      title.trim() || videoFile.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim() || 'Live Video';
-
-    const formData = new FormData();
-    formData.append('title', finalTitle);
-    formData.append('durationSec', String(detectedDuration || 60));
-    formData.append('video', videoFile);
-
     setUploading(true);
-    setUploadPct(0);
-    setUploadedBytes(0);
+    cancelledRef.current = false;
+    const uploadedBatch: VideoItem[] = [];
+    let anyFailed = false;
+    let firstErrorMsg = '';
 
-    const xhr = new XMLHttpRequest();
-    xhrRef.current = xhr;
+    for (const item of pendingItems) {
+      if (cancelledRef.current) break;
 
-    xhr.upload.onprogress = (ev) => {
-      if (ev.lengthComputable && ev.total > 0) {
-        setUploadedBytes(ev.loaded);
-        setUploadPct(Math.min(99, Math.round((ev.loaded / ev.total) * 100)));
-      }
-    };
+      setQueue((prev) =>
+        prev.map((q) =>
+          q.id === item.id
+            ? { ...q, status: 'uploading', progressPct: 0, uploadedBytes: 0, error: undefined }
+            : q
+        )
+      );
 
-    xhr.onload = () => {
-      xhrRef.current = null;
-      let parsed: { video?: VideoItem; error?: string } | null = null;
       try {
-        parsed = JSON.parse(xhr.responseText);
-      } catch {
-        parsed = null;
+        const saved = await uploadSingleFile(item);
+        uploadedBatch.push(saved);
+        setQueue((prev) =>
+          prev.map((q) =>
+            q.id === item.id
+              ? { ...q, status: 'done', uploadedBytes: item.file.size, progressPct: 100 }
+              : q
+          )
+        );
+      } catch (err) {
+        anyFailed = true;
+        const msg = err instanceof Error ? err.message : 'Upload failed';
+        if (!firstErrorMsg) firstErrorMsg = msg;
+        setQueue((prev) =>
+          prev.map((q) => (q.id === item.id ? { ...q, status: 'error', error: msg } : q))
+        );
       }
+    }
 
-      if (xhr.status >= 200 && xhr.status < 300 && parsed?.video) {
-        setUploadPct(100);
-        setUploading(false);
-        onVideoAdded(parsed.video);
-        resetForm();
-        onClose();
-      } else {
-        setUploading(false);
-        setError(parsed?.error || `Video upload failed (${xhr.status}).`);
-      }
-    };
+    if (uploadedBatch.length > 0) {
+      onVideosAdded(uploadedBatch);
+    }
 
-    xhr.onerror = () => {
-      xhrRef.current = null;
-      setUploading(false);
-      setError('Network error while uploading video file.');
-    };
-
-    xhr.onabort = () => {
-      xhrRef.current = null;
-      setUploading(false);
-    };
-
-    xhr.open('POST', '/api/videos');
-    xhr.send(formData);
+    setUploading(false);
+    if (!anyFailed && !cancelledRef.current) {
+      resetModal();
+      onClose();
+    } else if (anyFailed && !cancelledRef.current) {
+      setError(firstErrorMsg || 'Some files failed to upload. Retry or remove failed items.');
+    }
   };
+
+  const totalBytes = queue.reduce((acc, q) => acc + q.file.size, 0);
+  const doneCount = queue.filter((q) => q.status === 'done').length;
 
   return (
     <div
@@ -160,27 +340,27 @@ export function AddVideoModal({ open, onClose, onVideoAdded }: AddVideoModalProp
       aria-labelledby="add-video-heading"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
     >
-      <div className="w-full max-w-xl rounded-2xl border border-zinc-800 bg-[#101218] p-6 shadow-2xl">
+      <div className="flex max-h-[90vh] w-full max-w-2xl flex-col rounded-2xl border border-zinc-800 bg-[#101218] p-6 shadow-2xl">
         <div className="flex items-center justify-between gap-4 border-b border-zinc-800 pb-4">
           <div>
             <h2 id="add-video-heading" className="font-display text-xl font-bold text-white">
-              Upload Video for YouTube Live
+              Upload Videos &amp; Movies for Live Stream
             </h2>
             <p className="mt-0.5 text-xs text-zinc-400">
-              Upload large MP4, MKV, MOV, or WEBM videos (up to 2 GB) to stream directly 24/7 on YouTube.
+              Select 1 or multiple large video files (MP4, MKV, MOV, WEBM, TS, 3GP — chunked upload up to 2.5 GB each).
             </p>
           </div>
           <button
             type="button"
             onClick={handleClose}
-            aria-label="Close Upload Video modal"
+            aria-label="Close Upload Videos modal"
             className="inline-flex h-9 w-9 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-white"
           >
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="mt-5 space-y-4">
+        <form onSubmit={(e) => void handleSubmit(e)} className="mt-5 flex min-h-0 flex-1 flex-col gap-4">
           {error && (
             <div
               role="alert"
@@ -190,120 +370,149 @@ export function AddVideoModal({ open, onClose, onVideoAdded }: AddVideoModalProp
             </div>
           )}
 
-          <div>
-            <label htmlFor="video-title-input" className="block text-xs font-medium text-zinc-300">
-              Video Stream Title
-            </label>
+          <label
+            htmlFor="video-file-input"
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={handleDrop}
+            className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed px-5 py-6 text-center transition-colors ${
+              dragOver
+                ? 'border-white bg-white/5'
+                : 'border-zinc-700 bg-zinc-950/60 hover:border-zinc-500'
+            }`}
+          >
+            <Film className="h-7 w-7 text-zinc-300" />
+            <span className="mt-2 text-sm font-semibold text-white">
+              {queue.length > 0 ? 'Add More Videos / Movies' : 'Choose Multiple Video Files or Drag Here'}
+            </span>
+            <span className="mt-1 text-xs text-zinc-400">
+              5 MB smart chunking with auto-retry · MP4, MKV, MOV, WEBM, TS, AVI, 3GP
+            </span>
             <input
-              id="video-title-input"
-              type="text"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
+              ref={fileInputRef}
+              id="video-file-input"
+              type="file"
+              multiple
+              accept="video/*,.mp4,.mkv,.mov,.webm,.m4v,.ts,.avi,.flv,.3gp,.3g2,.mpeg,.mpg,.wmv,.ogv,.mts,.m2ts"
               disabled={uploading}
-              placeholder="e.g. 1 Hour Night Drift Mix Full Video"
-              className="mt-1.5 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3.5 py-2.5 text-sm text-white placeholder:text-zinc-500 focus:border-zinc-500 focus:outline-none disabled:opacity-60"
+              onChange={(e) => addFiles(e.target.files)}
+              className="sr-only"
             />
-          </div>
+          </label>
 
-          <div>
-            <label
-              htmlFor="video-file-input"
-              className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed px-5 py-7 text-center transition-colors ${
-                videoFile
-                  ? 'border-emerald-500/45 bg-emerald-500/[0.06]'
-                  : 'border-zinc-700 bg-zinc-950/60 hover:border-zinc-500'
-              }`}
-            >
-              {videoFile ? (
-                <CheckCircle2 className="h-7 w-7 text-emerald-400" />
-              ) : (
-                <Film className="h-7 w-7 text-zinc-400" />
-              )}
-              <span className="mt-2.5 max-w-full truncate text-sm font-semibold text-zinc-100">
-                {videoFile ? videoFile.name : 'Select Big Video File'}
-              </span>
-              <span className="mt-1 text-xs text-zinc-400">
-                MP4, MKV, MOV, WEBM, M4V, TS · Up to 2 GB
-              </span>
-              <input
-                ref={fileInputRef}
-                id="video-file-input"
-                type="file"
-                accept="video/*,.mp4,.mkv,.mov,.webm,.m4v,.ts,.avi,.flv"
-                disabled={uploading}
-                onChange={(e) => handleVideoFileChange(e.target.files?.[0] || null)}
-                className="sr-only"
-              />
-            </label>
-          </div>
-
-          {videoFile && (
-            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-zinc-800 bg-zinc-950/70 px-4 py-3 text-xs">
-              <div className="flex items-center gap-2 text-zinc-200">
-                <Video className="h-4 w-4 text-zinc-400" />
-                <span className="font-mono-tabular font-semibold">
-                  {formatFileSize(videoFile.size)}
+          {queue.length > 0 && (
+            <div className="flex min-h-0 flex-1 flex-col rounded-xl border border-zinc-800 bg-zinc-950/60">
+              <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5 text-xs text-zinc-300">
+                <span className="font-semibold">
+                  {queue.length} {queue.length === 1 ? 'file' : 'files'} selected · {formatFileSize(totalBytes)}
                 </span>
-                {detectedDims && (
-                  <>
-                    <span className="text-zinc-600">·</span>
-                    <span className="font-mono-tabular text-zinc-300">
-                      {detectedDims.w}×{detectedDims.h}
-                    </span>
-                  </>
-                )}
-                {detectedDuration > 0 && (
-                  <>
-                    <span className="text-zinc-600">·</span>
-                    <span className="font-mono-tabular text-zinc-300">
-                      {formatTimeMMSS(detectedDuration)}
-                    </span>
-                  </>
+                {uploading && (
+                  <span className="font-mono-tabular text-emerald-400">
+                    Uploaded {doneCount} / {queue.length}
+                  </span>
                 )}
               </div>
-              <span className="text-[11px] text-zinc-400">Ready for 24/7 RTMP loop</span>
+
+              <ul className="max-h-60 divide-y divide-zinc-800/80 overflow-y-auto px-3 py-1">
+                {queue.map((item, idx) => (
+                  <li key={item.id} className="flex items-center gap-3 py-2.5">
+                    <span className="font-mono-tabular w-5 text-xs text-zinc-500">
+                      {String(idx + 1).padStart(2, '0')}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <input
+                        type="text"
+                        value={item.title}
+                        disabled={uploading || item.status === 'done'}
+                        onChange={(e) =>
+                          setQueue((prev) =>
+                            prev.map((q) => (q.id === item.id ? { ...q, title: e.target.value } : q))
+                          )
+                        }
+                        aria-label={`Title for ${item.file.name}`}
+                        className="w-full rounded border border-zinc-800 bg-zinc-900/70 px-2.5 py-1 text-xs font-medium text-white focus:border-zinc-500 focus:outline-none disabled:opacity-60"
+                      />
+                      <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-zinc-400 font-mono-tabular">
+                        <span className="truncate">{item.file.name} · {formatFileSize(item.file.size)}</span>
+                        <span className="shrink-0">
+                          {item.status === 'done'
+                            ? 'Uploaded'
+                            : item.status === 'processing'
+                              ? 'Processing...'
+                              : item.status === 'uploading'
+                                ? `${formatFileSize(item.uploadedBytes)} · ${item.progressPct}%`
+                                : item.status === 'error'
+                                  ? 'Failed'
+                                  : 'Ready'}
+                        </span>
+                      </div>
+                      {(item.status === 'uploading' || item.status === 'processing') && (
+                        <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+                          <div
+                            className="h-full rounded-full bg-emerald-500 transition-all duration-150"
+                            style={{ width: `${item.progressPct}%` }}
+                          />
+                        </div>
+                      )}
+                      {item.error && (
+                        <p className="mt-1 text-[11px] text-red-400">{item.error}</p>
+                      )}
+                    </div>
+                    {item.status === 'done' ? (
+                      <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={uploading}
+                        onClick={() => setQueue((prev) => prev.filter((q) => q.id !== item.id))}
+                        aria-label={`Remove ${item.file.name}`}
+                        className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-red-400 disabled:opacity-30"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
 
-          {uploading && (
-            <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-950/80 p-3.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-medium text-zinc-200">
-                  {uploadPct >= 99 ? 'Processing video metadata & thumbnail...' : 'Uploading video to broadcast server...'}
-                </span>
-                <span className="font-mono-tabular font-semibold text-white">{uploadPct}%</span>
-              </div>
-              <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
-                <div
-                  className="h-full rounded-full bg-emerald-500 transition-all duration-150"
-                  style={{ width: `${uploadPct}%` }}
-                />
-              </div>
-              {videoFile && (
-                <p className="font-mono-tabular text-[11px] text-zinc-400">
-                  {formatFileSize(uploadedBytes)} / {formatFileSize(videoFile.size)}
-                </p>
-              )}
-            </div>
-          )}
-
-          <div className="flex items-center justify-end gap-3 border-t border-zinc-800 pt-4">
+          <div className="flex items-center justify-between gap-3 border-t border-zinc-800 pt-4">
             <button
               type="button"
-              onClick={handleClose}
-              className="rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-2 text-xs font-medium text-zinc-300 hover:text-white"
+              disabled={uploading}
+              onClick={() => fileInputRef.current?.click()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-xs font-medium text-zinc-200 hover:bg-zinc-800 disabled:opacity-40"
             >
-              {uploading ? 'Cancel Upload' : 'Cancel'}
+              <Plus className="h-3.5 w-3.5" />
+              <span>Add Files</span>
             </button>
-            <button
-              type="submit"
-              disabled={uploading || !videoFile}
-              data-testid="submit-video-upload"
-              className="inline-flex items-center gap-2 rounded-lg bg-white px-4 py-2 text-xs font-semibold text-zinc-950 hover:bg-zinc-200 disabled:opacity-50"
-            >
-              <Upload className="h-3.5 w-3.5" />
-              <span>{uploading ? `Uploading (${uploadPct}%)` : 'Upload & Add to Live'}</span>
-            </button>
+
+            <div className="flex items-center gap-2.5">
+              <button
+                type="button"
+                onClick={handleClose}
+                className="rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-2 text-xs font-medium text-zinc-300 hover:text-white"
+              >
+                {uploading ? 'Cancel Upload' : 'Cancel'}
+              </button>
+              <button
+                type="submit"
+                disabled={uploading || queue.length === 0}
+                data-testid="submit-video-upload"
+                className="inline-flex items-center gap-2 rounded-lg bg-white px-4 py-2 text-xs font-semibold text-zinc-950 hover:bg-zinc-200 disabled:opacity-50"
+              >
+                <Upload className="h-3.5 w-3.5" />
+                <span>
+                  {uploading
+                    ? `Uploading (${doneCount + 1}/${queue.length})`
+                    : `Upload ${queue.length || ''} ${queue.length === 1 ? 'Video' : 'Videos'}`}
+                </span>
+              </button>
+            </div>
           </div>
         </form>
       </div>

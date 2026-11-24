@@ -43,3 +43,23 @@
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.24);
 }
+
+@keyframes shieldZoomPulse {
+  0%, 100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(var(--shield-zoom-peak, 1.1));
+  }
+}
+
+.shield-zoom-pulse {
+  animation: shieldZoomPulse 6s ease-in-out infinite;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shield-zoom-pulse {
+    animation: none;
+  }
+}

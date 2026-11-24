@@ -3,17 +3,23 @@ import { EventEmitter } from 'events';
 import fs from 'fs';
 import net from 'net';
 import {
+  clamp,
+  DEFAULT_VIDEO_SHIELD,
   DEFAULT_VISUAL_SETTINGS,
   DEFAULT_YOUTUBE_RTMPS_URL,
+  isVideoShieldActive,
   maskStreamKey,
+  sanitizeWatermarkText,
   validateRtmpTarget,
   type PhonkTrack,
+  type QueueEndBehavior,
   type StreamConfig,
   type StreamMode,
   type StreamState,
   type StreamStatus,
   type VideoEncodeMode,
   type VideoItem,
+  type VideoShieldSettings,
   type VisualSettings,
 } from '../src/lib/phonkLogic.ts';
 import {
@@ -67,6 +73,9 @@ export class StreamEngine extends EventEmitter {
     autoReconnect: true,
     mode: 'video-24-7',
     videoEncodeMode: 'safe-encode',
+    queueEndBehavior: 'loop',
+    autoStopMinutes: 0,
+    videoShield: { ...DEFAULT_VIDEO_SHIELD },
     dryRun: false,
     visuals: { ...DEFAULT_VISUAL_SETTINGS },
   };
@@ -80,6 +89,7 @@ export class StreamEngine extends EventEmitter {
   private reconnectAttempts = 0;
   private measuredFps = 0;
   private measuredBitrateKbps = 0;
+  private stopReason: 'manual' | 'queue-completed' | 'timer-completed' | 'error' | null = null;
   private lastError: string | null = null;
 
   private muxerProc: ChildProcess | null = null;
@@ -91,6 +101,7 @@ export class StreamEngine extends EventEmitter {
   private stopRequested = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private uptimeInterval: NodeJS.Timeout | null = null;
+  private finishCleanupTimer: NodeJS.Timeout | null = null;
   private fontPath: string | null;
 
   constructor(store: TrackStore, videoStore: VideoStore) {
@@ -138,6 +149,63 @@ export class StreamEngine extends EventEmitter {
     if (patch.videoEncodeMode === 'safe-encode' || patch.videoEncodeMode === 'direct-copy') {
       this.config.videoEncodeMode = patch.videoEncodeMode;
     }
+    if (patch.queueEndBehavior === 'loop' || patch.queueEndBehavior === 'stop-after-queue') {
+      this.config.queueEndBehavior = patch.queueEndBehavior;
+    }
+    if (typeof patch.autoStopMinutes === 'number') {
+      this.config.autoStopMinutes = Math.min(1440, Math.max(0, Math.round(patch.autoStopMinutes)));
+    }
+    if (patch.videoShield && typeof patch.videoShield === 'object') {
+      const s = patch.videoShield as Partial<VideoShieldSettings>;
+      const prev = this.config.videoShield || DEFAULT_VIDEO_SHIELD;
+      const preset =
+        s.preset === 'movie-stealth' ||
+        s.preset === 'framed-pip' ||
+        s.preset === 'audio-color' ||
+        s.preset === 'original'
+          ? s.preset
+          : prev.preset;
+      const watermarkPos =
+        s.watermarkPos === 'top-left' ||
+        s.watermarkPos === 'top-right' ||
+        s.watermarkPos === 'bottom-right'
+          ? s.watermarkPos
+          : prev.watermarkPos;
+      this.config.videoShield = {
+        preset,
+        mirrorFlip: typeof s.mirrorFlip === 'boolean' ? s.mirrorFlip : prev.mirrorFlip,
+        zoomPulse: typeof s.zoomPulse === 'boolean' ? s.zoomPulse : prev.zoomPulse,
+        zoomIntensityPct:
+          typeof s.zoomIntensityPct === 'number'
+            ? clamp(Math.round(s.zoomIntensityPct), 4, 16)
+            : prev.zoomIntensityPct,
+        ambientPipFrame:
+          typeof s.ambientPipFrame === 'boolean' ? s.ambientPipFrame : prev.ambientPipFrame,
+        colorShift: typeof s.colorShift === 'boolean' ? s.colorShift : prev.colorShift,
+        hueShiftDeg:
+          typeof s.hueShiftDeg === 'number'
+            ? clamp(Math.round(s.hueShiftDeg), -25, 25)
+            : prev.hueShiftDeg,
+        speedFactor:
+          typeof s.speedFactor === 'number'
+            ? clamp(Number(s.speedFactor.toFixed(2)), 0.94, 1.08)
+            : prev.speedFactor,
+        bassBoomDb:
+          typeof s.bassBoomDb === 'number'
+            ? clamp(Math.round(s.bassBoomDb), 0, 12)
+            : prev.bassBoomDb,
+        audioPitchShiftPct:
+          typeof s.audioPitchShiftPct === 'number'
+            ? clamp(Math.round(s.audioPitchShiftPct), -6, 6)
+            : prev.audioPitchShiftPct,
+        stereoWiden: typeof s.stereoWiden === 'boolean' ? s.stereoWiden : prev.stereoWiden,
+        watermarkText:
+          typeof s.watermarkText === 'string'
+            ? sanitizeWatermarkText(s.watermarkText)
+            : prev.watermarkText,
+        watermarkPos,
+      };
+    }
     if (typeof patch.dryRun === 'boolean') {
       this.config.dryRun = patch.dryRun;
     }
@@ -177,6 +245,12 @@ export class StreamEngine extends EventEmitter {
         ? Math.max(0, Math.floor((Date.now() - this.startedAt) / 1000))
         : 0;
 
+    const autoStopMin = this.config.autoStopMinutes || 0;
+    const autoStopRemainingSec =
+      autoStopMin > 0 && this.startedAt && (this.state === 'live' || this.state === 'connecting' || this.state === 'reconnecting')
+        ? Math.max(0, autoStopMin * 60 - uptimeSec)
+        : null;
+
     return {
       state: this.state,
       mode: this.config.mode,
@@ -193,6 +267,9 @@ export class StreamEngine extends EventEmitter {
       fps: this.measuredFps || (this.state === 'live' ? this.config.fps : 0),
       bitrateKbps: this.measuredBitrateKbps || (this.state === 'live' ? this.config.videoBitrateKbps : 0),
       resolution: this.config.resolution,
+      queueEndBehavior: (this.config.queueEndBehavior || 'loop') as QueueEndBehavior,
+      autoStopRemainingSec,
+      stopReason: this.stopReason,
       lastError: this.lastError,
     };
   }
@@ -260,6 +337,7 @@ export class StreamEngine extends EventEmitter {
 
     this.stopInternal(false);
     this.stopRequested = false;
+    this.stopReason = null;
     this.lastError = null;
     this.reconnectAttempts = 0;
     this.consecutiveWorkerFailures = 0;
@@ -273,6 +351,14 @@ export class StreamEngine extends EventEmitter {
     if (this.uptimeInterval) clearInterval(this.uptimeInterval);
     this.uptimeInterval = setInterval(() => {
       if (this.state === 'live' || this.state === 'connecting' || this.state === 'reconnecting') {
+        const autoStopMin = this.config.autoStopMinutes || 0;
+        if (autoStopMin > 0 && this.startedAt) {
+          const elapsedSec = Math.floor((Date.now() - this.startedAt) / 1000);
+          if (elapsedSec >= autoStopMin * 60) {
+            this.finishStreamCleanly('timer-completed');
+            return;
+          }
+        }
         this.emitStatus();
       }
     }, 1000);
@@ -287,7 +373,60 @@ export class StreamEngine extends EventEmitter {
   }
 
   stop(): void {
+    this.stopReason = 'manual';
     this.stopInternal(true);
+  }
+
+  private finishStreamCleanly(reason: 'queue-completed' | 'timer-completed'): void {
+    this.stopRequested = true;
+    this.stopReason = reason;
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.uptimeInterval) {
+      clearInterval(this.uptimeInterval);
+      this.uptimeInterval = null;
+    }
+    if (this.finishCleanupTimer) {
+      clearTimeout(this.finishCleanupTimer);
+      this.finishCleanupTimer = null;
+    }
+
+    const w = this.workerProc;
+    this.workerProc = null;
+    this.killProc(w);
+
+    const m = this.muxerProc;
+    this.muxerProc = null;
+    if (m) {
+      m.stdout?.removeAllListeners('data');
+      m.stderr?.removeAllListeners('data');
+      m.removeAllListeners('close');
+      try {
+        // End stdin cleanly so FLV trailer/RTMP closeStream reaches YouTube Live cleanly
+        m.stdin?.end();
+      } catch {
+        // ignore
+      }
+      this.finishCleanupTimer = setTimeout(() => {
+        try {
+          m.kill('SIGTERM');
+        } catch {
+          // ignore
+        }
+      }, 2200);
+    }
+
+    this.state = 'idle';
+    this.startedAt = null;
+    this.measuredFps = 0;
+    this.measuredBitrateKbps = 0;
+    this.currentTrackId = null;
+    this.currentTrackTitle = '';
+    this.lastError = null;
+    this.emitStatus();
   }
 
   private killProc(proc: ChildProcess | null): void {
@@ -316,6 +455,10 @@ export class StreamEngine extends EventEmitter {
     if (this.uptimeInterval) {
       clearInterval(this.uptimeInterval);
       this.uptimeInterval = null;
+    }
+    if (this.finishCleanupTimer) {
+      clearTimeout(this.finishCleanupTimer);
+      this.finishCleanupTimer = null;
     }
 
     const w = this.workerProc;
@@ -519,6 +662,10 @@ export class StreamEngine extends EventEmitter {
         const nextIdx = this.currentTrackIndex + 1;
         if (nextIdx >= videos.length) {
           this.loopCount += 1;
+          if (this.config.queueEndBehavior === 'stop-after-queue') {
+            this.finishStreamCleanly('queue-completed');
+            return;
+          }
           this.currentTrackIndex = 0;
         } else {
           this.currentTrackIndex = nextIdx;
@@ -529,8 +676,16 @@ export class StreamEngine extends EventEmitter {
         this.lastError = this.sanitizeFfmpegError(workerStderr);
         if (this.consecutiveWorkerFailures >= Math.max(3, videos.length)) {
           this.stopInternal(false);
+          this.stopReason = 'error';
           this.state = 'error';
           this.emitStatus();
+          return;
+        }
+        if (
+          this.config.queueEndBehavior === 'stop-after-queue' &&
+          this.currentTrackIndex + 1 >= videos.length
+        ) {
+          this.finishStreamCleanly('queue-completed');
           return;
         }
         this.currentTrackIndex = (this.currentTrackIndex + 1) % videos.length;
@@ -545,9 +700,15 @@ export class StreamEngine extends EventEmitter {
     tsOffsetSec: number
   ): string[] {
     const encodeMode: VideoEncodeMode = this.config.videoEncodeMode || 'safe-encode';
+    const shield: VideoShieldSettings = this.config.videoShield || DEFAULT_VIDEO_SHIELD;
+    const shieldActive = isVideoShieldActive(shield);
+    const fps = this.config.fps;
     const [w, h] = this.config.resolution === '1920x1080' ? [1920, 1080] : [1280, 720];
-    const gop = this.config.fps * 2;
-    const canCopyVideo = encodeMode === 'direct-copy' && video.videoCodec.toLowerCase() === 'h264';
+    const gop = fps * 2;
+    const canCopyVideo =
+      encodeMode === 'direct-copy' &&
+      !shieldActive &&
+      video.videoCodec.toLowerCase() === 'h264';
 
     if (canCopyVideo) {
       if (video.hasAudio) {
@@ -608,19 +769,103 @@ export class StreamEngine extends EventEmitter {
       ];
     }
 
-    const scalePadFilter = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=#08090d,setsar=1,format=yuv420p`;
+    // Build Content-ID / Transform Shield filtergraph
+    const speedFactor = clamp(shield.speedFactor || 1.0, 0.94, 1.08);
+    const pitchFactor = clamp(1 + (shield.audioPitchShiftPct || 0) / 100, 0.92, 1.08);
+    const zoomAmp = clamp((shield.zoomIntensityPct || 10) / 100, 0.04, 0.16);
+    const hueDeg = clamp(shield.hueShiftDeg || 0, -25, 25);
+    const bassDb = clamp(shield.bassBoomDb || 0, 0, 12);
+    const safeWatermark = sanitizeWatermarkText(shield.watermarkText || '');
+    const fontArg = this.fontPath ? `fontfile=${this.fontPath}:` : '';
+
+    const baseSteps = [
+      'setpts=PTS-STARTPTS',
+      ...(shield.mirrorFlip ? ['hflip'] : []),
+      `fps=${fps}`,
+      `scale=${w}:${h}:force_original_aspect_ratio=decrease`,
+      `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=#08090d`,
+      'setsar=1',
+    ];
+
+    const filterParts: string[] = [];
+    filterParts.push(`[0:v]${baseSteps.join(',')}[vbase]`);
+
+    if (shield.ambientPipFrame) {
+      const fgW = Math.floor((w * 0.88) / 2) * 2;
+      const fgH = Math.floor((h * 0.88) / 2) * 2;
+      filterParts.push(`[vbase]split[vbg_src][vfg_src]`);
+      filterParts.push(
+        `[vbg_src]crop=iw*0.86:ih*0.86,scale=${w}:${h}:flags=fast_bilinear,boxblur=16:2,eq=brightness=-0.14:saturation=1.2[vbg]`
+      );
+      if (shield.zoomPulse) {
+        filterParts.push(
+          `[vfg_src]zoompan=z='1+${zoomAmp.toFixed(3)}*(0.5-0.5*cos(on*2*PI/(6*${fps})))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${fgW}x${fgH}:fps=${fps}[vfg]`
+        );
+      } else {
+        filterParts.push(`[vfg_src]scale=${fgW}:${fgH}:flags=bilinear[vfg]`);
+      }
+      filterParts.push(`[vbg][vfg]overlay=(W-w)/2:(H-h)/2[vcomp]`);
+    } else if (shield.zoomPulse) {
+      filterParts.push(
+        `[vbase]zoompan=z='1+${zoomAmp.toFixed(3)}*(0.5-0.5*cos(on*2*PI/(6*${fps})))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${w}x${h}:fps=${fps}[vcomp]`
+      );
+    } else {
+      filterParts.push(`[vbase]null[vcomp]`);
+    }
+
+    const postVSteps: string[] = [];
+    if (shield.colorShift) {
+      postVSteps.push(`eq=contrast=1.06:saturation=1.14`, `hue=h=${hueDeg}`);
+    }
+    if (safeWatermark) {
+      const margin = Math.round((w / 1280) * 24);
+      const fontSz = Math.round((w / 1280) * 22);
+      const posExpr =
+        shield.watermarkPos === 'top-left'
+          ? `x=${margin}:y=${margin}`
+          : shield.watermarkPos === 'bottom-right'
+            ? `x=w-tw-${margin}:y=h-th-${margin}`
+            : `x=w-tw-${margin}:y=${margin}`;
+      postVSteps.push(
+        `drawtext=${fontArg}text='${safeWatermark}':${posExpr}:fontsize=${fontSz}:fontcolor=0xffffff@0.92:box=1:boxcolor=0x000000@0.55:boxborderw=8`
+      );
+    }
+    if (Math.abs(speedFactor - 1) > 0.005) {
+      postVSteps.push(`setpts=PTS/${speedFactor.toFixed(2)}`);
+    }
+    postVSteps.push('format=yuv420p');
+    filterParts.push(`[vcomp]${postVSteps.join(',')}[vout]`);
 
     if (video.hasAudio) {
+      const aSteps: string[] = ['aresample=44100'];
+      if (Math.abs(pitchFactor - 1) > 0.002) {
+        aSteps.push(`asetrate=${Math.round(44100 * pitchFactor)}`, 'aresample=44100');
+      }
+      const tempoFactor = clamp(speedFactor / pitchFactor, 0.82, 1.25);
+      if (Math.abs(tempoFactor - 1) > 0.002) {
+        aSteps.push(`atempo=${tempoFactor.toFixed(4)}`);
+      }
+      if (bassDb > 0) {
+        aSteps.push(`bass=g=${bassDb}:f=75:w=0.6`);
+      }
+      if (shield.stereoWiden) {
+        aSteps.push('extrastereo=m=1.35');
+      }
+      if (bassDb > 0 || shield.stereoWiden) {
+        aSteps.push('acompressor=threshold=-14dB:ratio=3');
+      }
+      filterParts.push(`[0:a]${aSteps.join(',')}[aout]`);
+
       return [
         '-re',
         '-i',
         videoPath,
-        '-vf',
-        scalePadFilter,
+        '-filter_complex',
+        filterParts.join(';'),
         '-map',
-        '0:v:0',
+        '[vout]',
         '-map',
-        '0:a:0',
+        '[aout]',
         '-c:v',
         'libx264',
         '-preset',
@@ -628,7 +873,7 @@ export class StreamEngine extends EventEmitter {
         '-pix_fmt',
         'yuv420p',
         '-r',
-        String(this.config.fps),
+        String(fps),
         '-g',
         String(gop),
         '-keyint_min',
@@ -665,10 +910,10 @@ export class StreamEngine extends EventEmitter {
       'lavfi',
       '-i',
       'anullsrc=r=44100:cl=stereo',
-      '-vf',
-      scalePadFilter,
+      '-filter_complex',
+      filterParts.join(';'),
       '-map',
-      '0:v:0',
+      '[vout]',
       '-map',
       '1:a:0',
       '-c:v',
@@ -678,7 +923,7 @@ export class StreamEngine extends EventEmitter {
       '-pix_fmt',
       'yuv420p',
       '-r',
-      String(this.config.fps),
+      String(fps),
       '-g',
       String(gop),
       '-keyint_min',

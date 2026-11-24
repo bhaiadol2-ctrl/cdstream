@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildPaletteFromRGB,
+  buildVideoShieldPreset,
+  calculateUploadChunks,
   computeProgressPercent,
   formatFileSize,
   formatTimeMMSS,
@@ -9,8 +11,11 @@ import {
   getNextLoopIndex,
   getPreviousLoopIndex,
   isDirectCopyCompatibleVideo,
+  isLikelyVideoFile,
+  isVideoShieldActive,
   maskStreamKey,
   reorderTracks,
+  sanitizeWatermarkText,
   validateRtmpTarget,
 } from './phonkLogic';
 
@@ -43,6 +48,52 @@ test('isDirectCopyCompatibleVideo detects H.264 + AAC streams accurately', () =>
     isDirectCopyCompatibleVideo({ videoCodec: 'h264', audioCodec: '', hasAudio: false }),
     false
   );
+});
+
+test('calculateUploadChunks splits large files into bounded chunk slices', () => {
+  assert.deepEqual(calculateUploadChunks(0, 1024), []);
+  const slices = calculateUploadChunks(12 * 1024 * 1024 + 500, 5 * 1024 * 1024);
+  assert.equal(slices.length, 3);
+  assert.deepEqual(slices[0], { index: 0, start: 0, end: 5 * 1024 * 1024, size: 5 * 1024 * 1024 });
+  assert.deepEqual(slices[1], {
+    index: 1,
+    start: 5 * 1024 * 1024,
+    end: 10 * 1024 * 1024,
+    size: 5 * 1024 * 1024,
+  });
+  assert.deepEqual(slices[2], {
+    index: 2,
+    start: 10 * 1024 * 1024,
+    end: 12 * 1024 * 1024 + 500,
+    size: 2 * 1024 * 1024 + 500,
+  });
+});
+
+test('isLikelyVideoFile recognizes standard and mobile video formats', () => {
+  assert.equal(isLikelyVideoFile('movie.MKV', ''), true);
+  assert.equal(isLikelyVideoFile('clip.3gp', 'application/octet-stream'), true);
+  assert.equal(isLikelyVideoFile('stream.mp4', 'video/mp4'), true);
+  assert.equal(isLikelyVideoFile('photo.jpg', 'image/jpeg'), false);
+});
+
+test('buildVideoShieldPreset and isVideoShieldActive toggle transform states accurately', () => {
+  const stealth = buildVideoShieldPreset('movie-stealth', '@CinemaLive');
+  assert.equal(stealth.mirrorFlip, true);
+  assert.equal(stealth.zoomPulse, true);
+  assert.equal(stealth.bassBoomDb, 6);
+  assert.equal(stealth.watermarkText, '@CinemaLive');
+  assert.equal(isVideoShieldActive(stealth), true);
+
+  const raw = buildVideoShieldPreset('original');
+  assert.equal(raw.mirrorFlip, false);
+  assert.equal(raw.zoomPulse, false);
+  assert.equal(raw.bassBoomDb, 0);
+  assert.equal(isVideoShieldActive(raw), false);
+});
+
+test('sanitizeWatermarkText strips unsafe FFmpeg filter characters', () => {
+  assert.equal(sanitizeWatermarkText("  @MovieLive:24/7;'[test]  "), '@MovieLive24/7test');
+  assert.equal(sanitizeWatermarkText('Channel\nLine2'), 'ChannelLine2');
 });
 
 test('formatUptimeHHMMSS formats broadcast duration cleanly', () => {

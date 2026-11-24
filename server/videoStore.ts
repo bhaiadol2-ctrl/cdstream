@@ -9,7 +9,28 @@ const execFileAsync = promisify(execFile);
 
 export const VIDEOS_DIR = path.join(UPLOADS_DIR, 'videos');
 export const VIDEO_THUMBS_DIR = path.join(VIDEOS_DIR, 'thumbs');
+export const VIDEO_CHUNKS_DIR = path.join(VIDEOS_DIR, 'chunks');
 const VIDEOS_FILE = path.join(DATA_DIR, 'videos.json');
+
+export function cleanupStaleChunks(maxAgeMs = 6 * 60 * 60 * 1000): void {
+  try {
+    fs.mkdirSync(VIDEO_CHUNKS_DIR, { recursive: true });
+    const now = Date.now();
+    for (const entry of fs.readdirSync(VIDEO_CHUNKS_DIR)) {
+      const fullPath = path.join(VIDEO_CHUNKS_DIR, entry);
+      try {
+        const st = fs.statSync(fullPath);
+        if (st.isFile() && now - st.mtimeMs > maxAgeMs) {
+          fs.unlinkSync(fullPath);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
 
 export interface ProbedVideoMeta {
   durationSec: number;
@@ -31,15 +52,19 @@ export async function probeVideoMetadata(filePath: string): Promise<ProbedVideoM
   };
 
   try {
-    const { stdout } = await execFileAsync('ffprobe', [
-      '-v',
-      'error',
-      '-print_format',
-      'json',
-      '-show_format',
-      '-show_streams',
-      filePath,
-    ]);
+    const { stdout } = await execFileAsync(
+      'ffprobe',
+      [
+        '-v',
+        'error',
+        '-print_format',
+        'json',
+        '-show_format',
+        '-show_streams',
+        filePath,
+      ],
+      { timeout: 25_000, maxBuffer: 4 * 1024 * 1024 }
+    );
     const parsed = JSON.parse(stdout);
     const streams = Array.isArray(parsed?.streams) ? parsed.streams : [];
     const videoStream = streams.find((s: { codec_type?: string }) => s?.codec_type === 'video');
@@ -77,31 +102,15 @@ export async function extractVideoThumbnail(
   fs.mkdirSync(path.dirname(outThumbPath), { recursive: true });
   const seekSec = durationSec > 3 ? '2' : '0';
   try {
-    await execFileAsync('ffmpeg', [
-      '-hide_banner',
-      '-loglevel',
-      'error',
-      '-y',
-      '-ss',
-      seekSec,
-      '-i',
-      videoPath,
-      '-frames:v',
-      '1',
-      '-vf',
-      'scale=640:-2',
-      '-q:v',
-      '3',
-      outThumbPath,
-    ]);
-    return fs.existsSync(outThumbPath);
-  } catch {
-    try {
-      await execFileAsync('ffmpeg', [
+    await execFileAsync(
+      'ffmpeg',
+      [
         '-hide_banner',
         '-loglevel',
         'error',
         '-y',
+        '-ss',
+        seekSec,
         '-i',
         videoPath,
         '-frames:v',
@@ -111,7 +120,31 @@ export async function extractVideoThumbnail(
         '-q:v',
         '3',
         outThumbPath,
-      ]);
+      ],
+      { timeout: 25_000 }
+    );
+    return fs.existsSync(outThumbPath);
+  } catch {
+    try {
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-y',
+          '-i',
+          videoPath,
+          '-frames:v',
+          '1',
+          '-vf',
+          'scale=640:-2',
+          '-q:v',
+          '3',
+          outThumbPath,
+        ],
+        { timeout: 25_000 }
+      );
       return fs.existsSync(outThumbPath);
     } catch {
       return false;
@@ -126,6 +159,7 @@ export class VideoStore {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.mkdirSync(VIDEOS_DIR, { recursive: true });
     fs.mkdirSync(VIDEO_THUMBS_DIR, { recursive: true });
+    fs.mkdirSync(VIDEO_CHUNKS_DIR, { recursive: true });
     this.load();
   }
 
@@ -204,5 +238,21 @@ export class VideoStore {
       }
     }
     return true;
+  }
+
+  clearAll(): void {
+    const items = [...this.videos];
+    this.videos = [];
+    this.save();
+    for (const item of items) {
+      for (const assetUrl of [item.videoUrl, item.thumbnailUrl]) {
+        if (assetUrl && assetUrl.startsWith('/uploads/videos/')) {
+          const safePath = resolveSafeAssetPath(assetUrl);
+          if (safePath && safePath.startsWith(VIDEOS_DIR + path.sep)) {
+            fs.unlink(safePath, () => undefined);
+          }
+        }
+      }
+    }
   }
 }
